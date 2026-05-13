@@ -1,0 +1,33 @@
+modLoader="javafml"
+loaderVersion="${loader_version_range}"
+license="${mod_license}"
+
+[[mods]]
+modId="superbhorizon"
+version="0.1.0"
+displayName="Superb Horizons"
+description='''${mod_description}'''
+
+# SuperbWarfare dependency
+[[dependencies.${mod_id}]]
+    modId="superbwarfare"
+    mandatory=true
+    versionRange="[0.8.0,)"
+    ordering="AFTER"
+    side="BOTH"
+
+# Forge dependency
+[[dependencies.${mod_id}]]
+    modId="forge"
+    mandatory=true
+    versionRange="${forge_version_range}"
+    ordering="NONE"
+    side="BOTH"
+
+# Minecraft dependency
+[[dependencies.${mod_id}]]
+    modId="minecraft"
+    mandatory=true
+    versionRange="${minecraft_version_range}"
+    ordering="NONE"
+    side="BOTH"
