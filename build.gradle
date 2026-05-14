@@ -74,6 +74,11 @@ minecraft {
             // Please read: https://stackoverflow.com/questions/2031163/when-to-use-the-different-log-levels
             property 'forge.logging.console.level', 'debug'
 
+            // External runtime mods such as Superb Warfare ship production refmaps.
+            // Remap them when running in ForgeGradle's official-mapped userdev environment.
+            property 'mixin.env.remapRefMap', 'true'
+            property 'mixin.env.refMapRemappingFile', "${buildDir}/createSrgToMcp/output.srg"
+
             mods {
                 "${mod_id}" {
                     source sourceSets.main
@@ -168,6 +173,10 @@ dependencies {
 
     implementation fg.deobf("curse.maven:superb-warfare-1218165:8046997")
 
+    implementation fg.deobf("curse.maven:kotlin-for-forge-351264:5402061")
+
+    implementation fg.deobf("curse.maven:curios-309927:4812541")
+
     compileOnly "blank:superb_modern_combat-1.20.1-0.0.1-8.9-div"
 
     compileOnly(fg.deobf("com.github.mcmodderanchor:simplebedrockmodel:2.2.1-forge+mc1.20.1"))
@@ -247,4 +256,8 @@ publishing {
 
 tasks.withType(JavaCompile).configureEach {
     options.encoding = 'UTF-8' // Use the UTF-8 charset for Java compilation
+}
+
+tasks.matching { it.name in ['runClient', 'runServer', 'runGameTestServer', 'runData'] }.configureEach {
+    dependsOn 'createSrgToMcp'
 }

@@ -1,18 +1,24 @@
 package com.atsuishio.superbhorizon.client.renderer;
 
+import com.atsuishio.superbhorizon.SuperbHorizonConfig;
 import com.atsuishio.superbhorizon.network.GhostNetwork;
+import com.atsuishio.superbwarfare.entity.vehicle.base.VehicleEntity;
 import com.mojang.blaze3d.systems.RenderSystem;
 import com.mojang.blaze3d.vertex.BufferBuilder;
 import com.mojang.blaze3d.vertex.PoseStack;
 import com.mojang.blaze3d.vertex.Tesselator;
 import com.mojang.blaze3d.vertex.VertexSorting;
+import com.mojang.logging.LogUtils;
 import com.mojang.math.Axis;
 import net.minecraft.client.Camera;
 import net.minecraft.client.Minecraft;
+import net.minecraft.client.renderer.LightTexture;
 import net.minecraft.client.renderer.MultiBufferSource;
+import net.minecraft.core.BlockPos;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.EntityType;
+import net.minecraft.world.level.LightLayer;
 import net.minecraft.world.phys.Vec3;
 import net.minecraftforge.api.distmarker.Dist;
 import net.minecraftforge.client.event.ClientPlayerNetworkEvent;
@@ -22,60 +28,69 @@ import net.minecraftforge.eventbus.api.SubscribeEvent;
 import net.minecraftforge.fml.common.Mod;
 import net.minecraftforge.registries.ForgeRegistries;
 import org.joml.Matrix4f;
-
-import net.minecraft.client.renderer.LightTexture;
-import net.minecraft.core.BlockPos;
-import net.minecraft.world.level.LightLayer;
+import org.slf4j.Logger;
 
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 
 @Mod.EventBusSubscriber(value = Dist.CLIENT, bus = Mod.EventBusSubscriber.Bus.FORGE)
 public class VehicleGhostRenderer {
 
-    private static final Map<UUID, VehicleGhostData> snapshots    = new HashMap<>(32);
-    private static final Map<String, Object>          polyMeshCache = new HashMap<>();
-    private static final Map<String, Entity>          dummyEntities = new HashMap<>();
+    private static final Logger LOGGER = LogUtils.getLogger();
+    private static final Map<UUID, VehicleGhostData> snapshots = new HashMap<>(32);
+    private static final Map<String, Object> polyMeshCache = new HashMap<>();
+    private static final Map<String, Entity> dummyEntities = new HashMap<>();
+    private static final Set<String> loggedRenderFailures = new HashSet<>();
 
-    // ─── sbwmeshloader リフレクション ────────────────────────────────────
-    // 対象: com.example.sbwmeshloader.core.PolyMeshLoader / PolyMeshModel
-    //       com.github.mcmodderanchor.simplebedrockmodel...BedrockModel
-    private static Method  loadModelMethod   = null; // PolyMeshLoader.loadModel(ResourceLocation)
-    private static Method  renderSplitMethod = null; // PolyMeshModel.renderWithTranslucentSplit(...)
-    private static Field   meshMapField      = null; // PolyMeshModel.meshMap（poly_mesh 有無の判定）
-    private static Field   bindPoseField     = null; // BedrockModel.bindPose
-    private static Method  applyPoseMethod   = null; // BedrockModel.applyPose(Pose)
+    private static Method loadModelMethod = null;
+    private static Method renderSplitMethod = null;
+    private static Field meshMapField = null;
+    private static Field bindPoseField = null;
+    private static Method applyPoseMethod = null;
 
     private static boolean reflectionInitialized = false;
-    private static boolean reflectionAvailable   = false;
+    private static boolean reflectionAvailable = false;
 
-    private static final double GHOST_SWITCH_DISTANCE_SQ = 96.0 * 96.0;
-
-    // ─── パケットハンドラ ─────────────────────────────────────────────────
+    private static final float FAR_PLANE = 32000.0F;
 
     public static void onLoad(GhostNetwork.LoadPacket pkt) {
-        snapshots.put(pkt.vehicleId, new VehicleGhostData(
-                pkt.entityId, pkt.vehicleId, pkt.typeKey,
-                pkt.x, pkt.y, pkt.z, pkt.yaw, pkt.pitch, pkt.roll));
+        loadSnapshot(pkt);
     }
 
-    public static void onUnload(UUID vehicleId) { snapshots.remove(vehicleId); }
+    public static void onBatchLoad(GhostNetwork.BatchLoadPacket pkt) {
+        if (pkt.clearFirst) {
+            clearSnapshots();
+        }
+        for (GhostNetwork.GhostSnapshot snapshot : pkt.snapshots) {
+            loadSnapshot(snapshot);
+        }
+    }
+
+    public static void onUnload(UUID vehicleId) {
+        snapshots.remove(vehicleId);
+    }
 
     public static void onTick(GhostNetwork.TickPacket pkt) {
         VehicleGhostData snap = snapshots.get(pkt.vehicleId);
         if (snap == null) return;
-        snap.entityId = pkt.entityId;
-        snap.x = pkt.x; snap.y = pkt.y; snap.z = pkt.z;
-        snap.yaw = pkt.yaw; snap.pitch = pkt.pitch; snap.roll = pkt.roll;
+        snap.update(pkt.entityId, pkt.x, pkt.y, pkt.z, pkt.yaw, pkt.pitch, pkt.roll, pkt.animation);
+    }
+
+    public static void clearSnapshots() {
+        snapshots.clear();
+        dummyEntities.clear();
     }
 
     @SubscribeEvent
     public static void onClientLogoff(ClientPlayerNetworkEvent.LoggingOut event) {
-        snapshots.clear();
+        clearSnapshots();
         polyMeshCache.clear();
+        loggedRenderFailures.clear();
     }
 
     @SubscribeEvent
@@ -86,253 +101,211 @@ public class VehicleGhostRenderer {
         }
     }
 
-    // ─── メインレンダーイベント ───────────────────────────────────────────
-
     @SubscribeEvent
     public static void onRenderLevelStage(RenderLevelStageEvent event) {
-        if (event.getStage() != RenderLevelStageEvent.Stage.AFTER_ENTITIES) return;
-        if (snapshots.isEmpty()) return;
+        if (event.getStage() != RenderLevelStageEvent.Stage.AFTER_ENTITIES || snapshots.isEmpty()) return;
 
         Minecraft mc = Minecraft.getInstance();
         if (mc.level == null || mc.player == null) return;
 
         Camera camera = event.getCamera();
-        Vec3 camPos = camera.getPosition();
+        Vec3 camPos = mc.player.getEyePosition();
         PoseStack ps = event.getPoseStack();
+        float partialTick = event.getPartialTick();
 
         BufferBuilder builder = Tesselator.getInstance().getBuilder();
         MultiBufferSource.BufferSource isolatedBuffers = MultiBufferSource.immediate(builder);
 
         Matrix4f oldProj = RenderSystem.getProjectionMatrix();
-        float fov    = (float) (2.0 * Math.atan(1.0 / oldProj.m11()));
-        float aspect = oldProj.m11() / oldProj.m00();
-        Matrix4f hugeProj = new Matrix4f().setPerspective(fov, aspect, 50.0F, 32000.0F);
-        RenderSystem.setProjectionMatrix(hugeProj, VertexSorting.DISTANCE_TO_ORIGIN);
-
         float oldFogStart = RenderSystem.getShaderFogStart();
-        float oldFogEnd   = RenderSystem.getShaderFogEnd();
-        RenderSystem.setShaderFogStart(32000.0F);
-        RenderSystem.setShaderFogEnd(32000.0F);
+        float oldFogEnd = RenderSystem.getShaderFogEnd();
 
-        for (VehicleGhostData snap : snapshots.values()) {
-            Entity realEntity = mc.level.getEntity(snap.entityId);
-            if (realEntity != null) {
-                double distSq = mc.player.distanceToSqr(snap.x, snap.y, snap.z);
-                if (distSq < GHOST_SWITCH_DISTANCE_SQ) continue;
-            }
+        try {
+            float fov = (float) (2.0 * Math.atan(1.0 / oldProj.m11()));
+            float aspect = oldProj.m11() / oldProj.m00();
+            Matrix4f hugeProj = new Matrix4f().setPerspective(fov, aspect, 50.0F, FAR_PLANE);
+            RenderSystem.setProjectionMatrix(hugeProj, VertexSorting.DISTANCE_TO_ORIGIN);
+            RenderSystem.setShaderFogStart(FAR_PLANE);
+            RenderSystem.setShaderFogEnd(FAR_PLANE);
 
-            try {
-                ps.pushPose();
-                ps.translate(snap.x - camPos.x, snap.y - camPos.y, snap.z - camPos.z);
-
-                // ──────────────────────────────────────────────────────────
-                // 描画ルーティング:
-                //  A) sbwmeshloader が存在 かつ poly_mesh を持つモデルが
-                //     ロードできた → PolyMeshModel パス
-                //  B) それ以外 → 既存の dummy Entity パス（通常 SBW 車両）
-                //
-                // typeKey のハードコードは一切不要。
-                // geo.json が存在して poly_mesh を含んでいれば自動的に A になる。
-                // ──────────────────────────────────────────────────────────
-                if (!tryRenderPolyMesh(snap, ps, isolatedBuffers)) {
-                    renderDummyEntity(snap, ps, isolatedBuffers, event.getPartialTick(), mc);
+            for (VehicleGhostData snap : snapshots.values()) {
+                if (snap.isStale()) {
+                    continue;
                 }
 
-                ps.popPose();
-            } catch (Exception ignored) {}
-        }
+                Entity realEntity = mc.level.getEntity(snap.entityId);
+                if (realEntity != null && !realEntity.isRemoved()) {
+                    continue;
+                }
 
-        isolatedBuffers.endBatch();
-        RenderSystem.setProjectionMatrix(oldProj, VertexSorting.DISTANCE_TO_ORIGIN);
-        RenderSystem.setShaderFogStart(oldFogStart);
-        RenderSystem.setShaderFogEnd(oldFogEnd);
+                double ghostSwitchDistance = SuperbHorizonConfig.GHOST_SWITCH_DISTANCE.get();
+                if (mc.player.distanceToSqr(snap.x, snap.y, snap.z) < ghostSwitchDistance * ghostSwitchDistance) {
+                    continue;
+                }
+
+                renderSnapshot(snap, ps, isolatedBuffers, partialTick, camPos, mc);
+            }
+        } finally {
+            isolatedBuffers.endBatch();
+            RenderSystem.setProjectionMatrix(oldProj, VertexSorting.DISTANCE_TO_ORIGIN);
+            RenderSystem.setShaderFogStart(oldFogStart);
+            RenderSystem.setShaderFogEnd(oldFogEnd);
+        }
     }
 
-    // ─── PolyMesh 描画 ────────────────────────────────────────────────────
+    private static void renderSnapshot(
+            VehicleGhostData snap,
+            PoseStack ps,
+            MultiBufferSource.BufferSource buffers,
+            float partialTick,
+            Vec3 camPos,
+            Minecraft mc) {
+        ps.pushPose();
+        try {
+            ps.translate(
+                    snap.renderX(partialTick) - camPos.x,
+                    snap.renderY(partialTick) - camPos.y,
+                    snap.renderZ(partialTick) - camPos.z);
 
-    /**
-     * sbwmeshloader の PolyMeshModel でゴーストを描画する。
-     *
-     * <h3>判定フロー</h3>
-     * <ol>
-     *   <li>sbwmeshloader がクラスパスに存在しない → false（リフレクション初期化失敗）</li>
-     *   <li>typeKey に対応する geo.json がロードできない → false（SBW 標準パスへ fallback）</li>
-     *   <li>ロードした PolyMeshModel の meshMap が空 → false
-     *       （poly_mesh を持たないモデルは SBW 標準パスで描く）</li>
-     *   <li>上記をすべて通過 → renderWithTranslucentSplit() を呼んで true を返す</li>
-     * </ol>
-     *
-     * <p>どのアドオンの geo.json でも、poly_mesh を含んでいれば typeKey に関係なく
-     * 自動的にこのパスで描画される。ハードコードリスト不要。</p>
-     */
+            if (snap.hasAnimationState() && SuperbHorizonConfig.PREFER_ANIMATED_ENTITY_FALLBACK.get()) {
+                if (!renderDummyEntity(snap, ps, buffers, partialTick, mc)) {
+                    tryRenderPolyMesh(snap, ps, buffers, partialTick);
+                }
+            } else if (!tryRenderPolyMesh(snap, ps, buffers, partialTick)) {
+                renderDummyEntity(snap, ps, buffers, partialTick, mc);
+            }
+        } catch (Exception e) {
+            logRenderFailureOnce("snapshot:" + snap.typeKey, "Failed to render ghost vehicle " + snap.typeKey, e);
+        } finally {
+            ps.popPose();
+        }
+    }
+
     private static boolean tryRenderPolyMesh(
             VehicleGhostData snap,
             PoseStack ps,
-            MultiBufferSource.BufferSource buffers) {
-
+            MultiBufferSource.BufferSource buffers,
+            float partialTick) {
         if (!initReflection()) return false;
+        if (!SuperbHorizonConfig.ENABLE_POLYMESH.get()) return false;
 
-        // キャッシュチェック（null = 「試行済みだが poly_mesh なし / ロード失敗」）
         Object mesh;
         if (polyMeshCache.containsKey(snap.typeKey)) {
             mesh = polyMeshCache.get(snap.typeKey);
             if (mesh == null) return false;
         } else {
-            // 未キャッシュ: ロード試行
             mesh = loadPolyMesh(snap.typeKey);
-
-            // poly_mesh を持つかチェック（meshMap が空なら SBW 標準パスへ）
-            if (mesh != null) {
-                try {
-                    Map<?, ?> map = (Map<?, ?>) meshMapField.get(mesh);
-                    if (map == null || map.isEmpty()) mesh = null;
-                } catch (Exception ignored) {}
+            if (mesh != null && !hasPolyMesh(mesh, snap.typeKey)) {
+                mesh = null;
             }
 
-            polyMeshCache.put(snap.typeKey, mesh); // null もキャッシュして再試行を防ぐ
+            polyMeshCache.put(snap.typeKey, mesh);
             if (mesh == null) return false;
         }
 
-        return doRenderMesh(mesh, snap, ps, buffers);
+        return doRenderMesh(mesh, snap, ps, buffers, partialTick);
     }
 
-    /**
-     * リフレクション経由で {@code renderWithTranslucentSplit()} を呼ぶ。
-     * 呼び出し前に bindPose を適用してアニメーションをリセットする。
-     */
-    private static boolean doRenderMesh(
-            Object mesh,
-            VehicleGhostData snap,
-            PoseStack ps,
-            MultiBufferSource.BufferSource buffers) {
+    private static boolean hasPolyMesh(Object mesh, String typeKey) {
         try {
-            // アニメーション状態をリセット
-            Object bindPose = bindPoseField.get(mesh);
-            applyPoseMethod.invoke(mesh, bindPose);
-
-            ResourceLocation texture = snap.textureLocation();
-
-            // 機体の向きを適用（applyEntityTransform 相当）
-            ps.pushPose();
-            ps.mulPose(Axis.YP.rotationDegrees(180f - snap.yaw));
-            ps.mulPose(Axis.XP.rotationDegrees(-snap.pitch));
-            ps.mulPose(Axis.ZP.rotationDegrees(-snap.roll));
-
-            // renderWithTranslucentSplit(PoseStack, MultiBufferSource, ResourceLocation, int)
-            int packedLight = samplePackedLight(snap);
-            renderSplitMethod.invoke(mesh, ps, buffers, texture, packedLight);
-
-            ps.popPose();
-            return true;
+            Map<?, ?> map = (Map<?, ?>) meshMapField.get(mesh);
+            return map != null && !map.isEmpty();
         } catch (Exception e) {
+            logRenderFailureOnce("meshMap:" + typeKey, "Could not inspect PolyMesh data for " + typeKey, e);
             return false;
         }
     }
 
-    /**
-     * typeKey から geo.json パスを組み立てて PolyMeshModel をロードする。
-     *
-     * <p>パス規則: {@code <namespace>:custom_geo/<path>.geo.json}<br>
-     * 例: {@code "superb_modern_combat:leopard2"} →
-     *     {@code ResourceLocation("superb_modern_combat", "custom_geo/leopard2.geo.json")}</p>
-     */
+    private static boolean doRenderMesh(
+            Object mesh,
+            VehicleGhostData snap,
+            PoseStack ps,
+            MultiBufferSource.BufferSource buffers,
+            float partialTick) {
+        ps.pushPose();
+        try {
+            Object bindPose = bindPoseField.get(mesh);
+            applyPoseMethod.invoke(mesh, bindPose);
+
+            ps.mulPose(Axis.YP.rotationDegrees(180.0F - snap.renderYaw(partialTick)));
+            ps.mulPose(Axis.XP.rotationDegrees(-snap.renderPitch(partialTick)));
+            ps.mulPose(Axis.ZP.rotationDegrees(-snap.renderRoll(partialTick)));
+
+            renderSplitMethod.invoke(mesh, ps, buffers, snap.textureLocation(), samplePackedLight(snap));
+            return true;
+        } catch (Exception e) {
+            logRenderFailureOnce("poly:" + snap.typeKey, "PolyMesh render failed for " + snap.typeKey + "; falling back to entity renderer", e);
+            return false;
+        } finally {
+            ps.popPose();
+        }
+    }
+
     private static Object loadPolyMesh(String typeKey) {
         try {
-            String namespace = typeKey.contains(":") ? typeKey.substring(0, typeKey.indexOf(':')) : "minecraft";
-            String path      = typeKey.contains(":") ? typeKey.substring(typeKey.indexOf(':') + 1) : typeKey;
-            ResourceLocation loc = new ResourceLocation(namespace, "custom_geo/" + path + ".geo.json");
+            ResourceLocation type = ResourceLocation.tryParse(typeKey);
+            if (type == null) return null;
+
+            ResourceLocation loc = ResourceLocation.fromNamespaceAndPath(type.getNamespace(), "custom_geo/" + type.getPath() + ".geo.json");
             return loadModelMethod.invoke(null, loc);
         } catch (Exception e) {
             return null;
         }
     }
 
-    // ─── 通常エンティティ描画（既存パス、変更なし）──────────────────────────
-
-    private static void renderDummyEntity(
+    private static boolean renderDummyEntity(
             VehicleGhostData snap,
             PoseStack ps,
             MultiBufferSource.BufferSource buffers,
             float partialTick,
             Minecraft mc) {
         Entity dummy = dummyEntities.computeIfAbsent(snap.typeKey, k -> {
-            EntityType<?> type = ForgeRegistries.ENTITY_TYPES.getValue(new ResourceLocation(k));
-            return (type != null) ? type.create(mc.level) : null;
-        });
-        if (dummy == null) return;
+            ResourceLocation id = ResourceLocation.tryParse(k);
+            if (id == null) return null;
 
-        dummy.setPos(snap.x, snap.y, snap.z);
-        dummy.setYRot(snap.yaw);
-        dummy.setXRot(snap.pitch);
-        dummy.yRotO = snap.yaw;
-        dummy.xRotO = snap.pitch;
+            EntityType<?> type = ForgeRegistries.ENTITY_TYPES.getValue(id);
+            return type != null ? type.create(mc.level) : null;
+        });
+        if (dummy == null) return false;
+
+        dummy.setPos(snap.renderX(partialTick), snap.renderY(partialTick), snap.renderZ(partialTick));
+        dummy.setYRot(snap.renderYaw(partialTick));
+        dummy.setXRot(snap.renderPitch(partialTick));
+        dummy.yRotO = snap.prevYaw;
+        dummy.xRotO = snap.prevPitch;
+        applyAnimationState(dummy, snap, partialTick);
 
         var renderer = mc.getEntityRenderDispatcher().getRenderer(dummy);
         if (renderer != null) {
-            int packedLight = samplePackedLight(snap);
-            renderer.render(dummy, snap.yaw, partialTick, ps, buffers, packedLight);
+            renderer.render(dummy, snap.renderYaw(partialTick), partialTick, ps, buffers, samplePackedLight(snap));
+            return true;
         }
+        return false;
     }
 
-    // ─── ライトレベル取得 ─────────────────────────────────────────────────
-
-    /**
-     * ゴーストの座標からワールドのライトレベルを取得して packed light 値を返す。
-     *
-     * <p>ゴーストは描画距離外にいるため、クライアントにそのチャンクがロードされていない
-     * 可能性がある。その場合は空のブロック光(0)と現在の空の光(skyLight)を使い、
-     * 夜間・屋内では暗くなるようにする。</p>
-     */
     private static int samplePackedLight(VehicleGhostData snap) {
         Minecraft mc = Minecraft.getInstance();
         if (mc.level == null) return LightTexture.FULL_BRIGHT;
 
         BlockPos pos = BlockPos.containing(snap.x, snap.y, snap.z);
-
-        // チャンクがロードされていれば正確な値を使う
         if (mc.level.isLoaded(pos)) {
             int block = mc.level.getBrightness(LightLayer.BLOCK, pos);
-            int sky   = mc.level.getBrightness(LightLayer.SKY,   pos);
+            int sky = mc.level.getBrightness(LightLayer.SKY, pos);
             return LightTexture.pack(block, sky);
         }
 
-        // チャンク未ロード（ゴーストが遠方にいる典型的なケース）:
-        // ブロック光は 0、空光は現在の時刻に応じた天空輝度で近似する
-        int skyDarken = mc.level.getSkyDarken(); // 0(昼)～15(夜)
-        int sky = Math.max(0, 15 - skyDarken);
+        int sky = Math.max(0, 15 - mc.level.getSkyDarken());
         return LightTexture.pack(0, sky);
     }
 
-    // ─── リフレクション初期化 ─────────────────────────────────────────────
-
-    /**
-     * sbwmeshloader のクラス・メソッド・フィールドをリフレクションで取得する。
-     *
-     * <p>sbwmeshloader が導入されていない環境では {@code ClassNotFoundException} が発生し、
-     * {@code reflectionAvailable = false} のまま終わる。この場合は全車両が
-     * dummy Entity パスにフォールバックする（通常の SBW 動作と同じ）。</p>
-     *
-     * <p>取得対象:</p>
-     * <ul>
-     *   <li>{@code com.example.sbwmeshloader.core.PolyMeshLoader
-     *       #loadModel(ResourceLocation)}</li>
-     *   <li>{@code com.example.sbwmeshloader.core.PolyMeshModel
-     *       #renderWithTranslucentSplit(PoseStack, MultiBufferSource, ResourceLocation, int)}</li>
-     *   <li>{@code com.example.sbwmeshloader.core.PolyMeshModel#meshMap}（poly_mesh 判定用）</li>
-     *   <li>{@code com.github.mcmodderanchor.simplebedrockmodel.v1.common.model.BedrockModel
-     *       #bindPose}</li>
-     *   <li>{@code BedrockModel#applyPose(Pose)}</li>
-     * </ul>
-     */
     private static boolean initReflection() {
         if (reflectionInitialized) return reflectionAvailable;
         reflectionInitialized = true;
+
         try {
-            // PolyMeshLoader
             Class<?> loaderClass = Class.forName("com.example.sbwmeshloader.core.PolyMeshLoader");
             loadModelMethod = loaderClass.getMethod("loadModel", ResourceLocation.class);
 
-            // PolyMeshModel
             Class<?> modelClass = Class.forName("com.example.sbwmeshloader.core.PolyMeshModel");
             renderSplitMethod = modelClass.getMethod(
                     "renderWithTranslucentSplit",
@@ -340,7 +313,6 @@ public class VehicleGhostRenderer {
             meshMapField = modelClass.getDeclaredField("meshMap");
             meshMapField.setAccessible(true);
 
-            // BedrockModel（SBW 付属の simplebedrockmodel ライブラリ）
             Class<?> bedrockModelClass = Class.forName(
                     "com.github.mcmodderanchor.simplebedrockmodel.v1.common.model.BedrockModel");
             bindPoseField = bedrockModelClass.getDeclaredField("bindPose");
@@ -349,9 +321,65 @@ public class VehicleGhostRenderer {
 
             reflectionAvailable = true;
         } catch (ClassNotFoundException | NoSuchMethodException | NoSuchFieldException e) {
-            // sbwmeshloader が存在しない環境では正常にここへ来る（エラーではない）
             reflectionAvailable = false;
+            LOGGER.debug("[SuperbHorizon] PolyMesh bridge is unavailable; using entity fallback renderer.");
         }
+
         return reflectionAvailable;
+    }
+
+    private static void logRenderFailureOnce(String key, String message, Exception e) {
+        if (loggedRenderFailures.add(key)) {
+            LOGGER.warn("[SuperbHorizon] {}", message, e);
+        }
+    }
+
+    private static void loadSnapshot(GhostNetwork.GhostSnapshot snapshot) {
+        snapshots.put(snapshot.vehicleId, new VehicleGhostData(
+                snapshot.entityId, snapshot.vehicleId, snapshot.typeKey,
+                snapshot.x, snapshot.y, snapshot.z, snapshot.yaw, snapshot.pitch, snapshot.roll, snapshot.animation));
+    }
+
+    private static void applyAnimationState(Entity dummy, VehicleGhostData snap, float partialTick) {
+        if (!(dummy instanceof VehicleEntity vehicle) || !snap.hasAnimationState()) return;
+
+        vehicle.setAbsoluteSpeed(snap.animAbsoluteSpeed(partialTick));
+        vehicle.setAbsoluteSpeedLerp(snap.animAbsoluteSpeed(partialTick));
+        vehicle.setTargetSpeed(snap.animTargetSpeed(partialTick));
+        vehicle.setPower(snap.animPower(partialTick));
+
+        vehicle.setTurretYRot(snap.animTurretYaw(partialTick));
+        vehicle.setTurretXRot(snap.animTurretPitch(partialTick));
+        vehicle.setTurretYRotO(snap.prevAnimation.turretYaw);
+        vehicle.setTurretXRotO(snap.prevAnimation.turretPitch);
+
+        vehicle.setGunYRot(snap.animGunYaw(partialTick));
+        vehicle.setGunXRot(snap.animGunPitch(partialTick));
+        vehicle.setGunYRotO(snap.prevAnimation.gunYaw);
+        vehicle.setGunXRotO(snap.prevAnimation.gunPitch);
+
+        vehicle.setLeftWheelRot(snap.animLeftWheelRot(partialTick));
+        vehicle.setRightWheelRot(snap.animRightWheelRot(partialTick));
+        vehicle.setLeftWheelRotO(snap.prevAnimation.leftWheelRot);
+        vehicle.setRightWheelRotO(snap.prevAnimation.rightWheelRot);
+        vehicle.setLeftTrack(snap.animLeftTrack(partialTick));
+        vehicle.setRightTrack(snap.animRightTrack(partialTick));
+        vehicle.setLeftTrackO(snap.prevAnimation.leftTrack);
+        vehicle.setRightTrackO(snap.prevAnimation.rightTrack);
+
+        vehicle.setPropellerRot(snap.animPropellerRot(partialTick));
+        vehicle.setPropellerRotO(snap.prevAnimation.propellerRot);
+        vehicle.setSynchedPropellerRot(snap.animPropellerRot(partialTick));
+        vehicle.setSynchedGearRot(snap.animGearRot(partialTick));
+        vehicle.setGearRot(snap.animGearRot(partialTick));
+        vehicle.setPlaneBreak(snap.animPlaneBreak(partialTick));
+
+        vehicle.setCannonRecoilTime(snap.animCannonRecoilTime());
+        vehicle.setCannonRecoilForce(snap.animCannonRecoilForce(partialTick));
+        vehicle.setGearUp(snap.animation.gearUp());
+        vehicle.setHoverMode(snap.animation.hoverMode());
+        vehicle.setWreck(snap.animation.wreck());
+        vehicle.setEngineStart(snap.animation.engineRunning());
+        vehicle.setEngineStartOver(snap.animation.engineRunning());
     }
 }
