@@ -109,7 +109,10 @@ public class VehicleGhostRenderer {
         if (mc.level == null || mc.player == null) return;
 
         Camera camera = event.getCamera();
-        Vec3 camPos = mc.player.getEyePosition();
+        // プレイヤーの目の位置（mc.player.getEyePosition()）ではなく、
+        // 描画エンジンが使用する実際のカメラ位置（camera.getPosition()）を使用することで、
+        // 視点移動やビューボビング（画面の揺れ）によるゴーストの表示ブレを完全に排除します。
+        Vec3 camPos = camera.getPosition();
         PoseStack ps = event.getPoseStack();
         float partialTick = event.getPartialTick();
 
@@ -123,7 +126,7 @@ public class VehicleGhostRenderer {
         try {
             float fov = (float) (2.0 * Math.atan(1.0 / oldProj.m11()));
             float aspect = oldProj.m11() / oldProj.m00();
-            Matrix4f hugeProj = new Matrix4f().setPerspective(fov, aspect, 50.0F, FAR_PLANE);
+            Matrix4f hugeProj = new Matrix4f().setPerspective(fov, aspect, 0.6F, FAR_PLANE);
             RenderSystem.setProjectionMatrix(hugeProj, VertexSorting.DISTANCE_TO_ORIGIN);
             RenderSystem.setShaderFogStart(FAR_PLANE);
             RenderSystem.setShaderFogEnd(FAR_PLANE);
@@ -138,7 +141,10 @@ public class VehicleGhostRenderer {
                     continue;
                 }
 
-                double ghostSwitchDistance = SuperbHorizonConfig.GHOST_SWITCH_DISTANCE.get();
+                // クライアントの実際の描画範囲（チャンク数 * 16.0）
+                double clientRenderDistance = mc.options.renderDistance().get() * 16.0;
+                // 設定されたゴースト切り替え距離と、プレイヤーの実際の視野距離の小さい方を動的な切り替え閾値として使用します
+                double ghostSwitchDistance = Math.min(clientRenderDistance, SuperbHorizonConfig.GHOST_SWITCH_DISTANCE.get());
                 if (mc.player.distanceToSqr(snap.x, snap.y, snap.z) < ghostSwitchDistance * ghostSwitchDistance) {
                     continue;
                 }
@@ -268,11 +274,18 @@ public class VehicleGhostRenderer {
         });
         if (dummy == null) return false;
 
-        dummy.setPos(snap.renderX(partialTick), snap.renderY(partialTick), snap.renderZ(partialTick));
-        dummy.setYRot(snap.renderYaw(partialTick));
-        dummy.setXRot(snap.renderPitch(partialTick));
-        dummy.yRotO = snap.prevYaw;
-        dummy.xRotO = snap.prevPitch;
+        // マイクラ標準の補間処理（Mth.rotLerp / Mth.lerp）による「二重補間（ガクつきの原因）」を防ぐため、
+        // 前回の値（O）に「現在のTickの開始点（0.0F）」の補間値を、
+        // 現在値に「現在のTick of 終了点（1.0F）」の補間値を代入することで、
+        // レンダラー内部の補間処理が100%線形で滑らかな等速直線運動（Jitterなし）として出力されるようにします。
+        dummy.xo = snap.renderX(0.0F);
+        dummy.yo = snap.renderY(0.0F);
+        dummy.zo = snap.renderZ(0.0F);
+        dummy.setPos(snap.renderX(1.0F), snap.renderY(1.0F), snap.renderZ(1.0F));
+        dummy.setYRot(snap.renderYaw(1.0F));
+        dummy.setXRot(snap.renderPitch(1.0F));
+        dummy.yRotO = snap.renderYaw(0.0F);
+        dummy.xRotO = snap.renderPitch(0.0F);
         applyAnimationState(dummy, snap, partialTick);
 
         var renderer = mc.getEntityRenderDispatcher().getRenderer(dummy);
@@ -348,30 +361,33 @@ public class VehicleGhostRenderer {
         vehicle.setTargetSpeed(snap.animTargetSpeed(partialTick));
         vehicle.setPower(snap.animPower(partialTick));
 
-        vehicle.setTurretYRot(snap.animTurretYaw(partialTick));
-        vehicle.setTurretXRot(snap.animTurretPitch(partialTick));
-        vehicle.setTurretYRotO(snap.prevAnimation.turretYaw);
-        vehicle.setTurretXRotO(snap.prevAnimation.turretPitch);
+        // 砲塔、主砲、車輪、キャタピラ、プロペラなどの各アニメーションパーツにおいても、
+        // 同様に「Tick開始時(0.0F)」と「Tick終了時(1.0F)」の補間値をセットし、
+        // レンダラー内部での二重補間（非線形なガタつき）を物理的に排除します。
+        vehicle.setTurretYRot(snap.animTurretYaw(1.0F));
+        vehicle.setTurretXRot(snap.animTurretPitch(1.0F));
+        vehicle.setTurretYRotO(snap.animTurretYaw(0.0F));
+        vehicle.setTurretXRotO(snap.animTurretPitch(0.0F));
 
-        vehicle.setGunYRot(snap.animGunYaw(partialTick));
-        vehicle.setGunXRot(snap.animGunPitch(partialTick));
-        vehicle.setGunYRotO(snap.prevAnimation.gunYaw);
-        vehicle.setGunXRotO(snap.prevAnimation.gunPitch);
+        vehicle.setGunYRot(snap.animGunYaw(1.0F));
+        vehicle.setGunXRot(snap.animGunPitch(1.0F));
+        vehicle.setGunYRotO(snap.animGunYaw(0.0F));
+        vehicle.setGunXRotO(snap.animGunPitch(0.0F));
 
-        vehicle.setLeftWheelRot(snap.animLeftWheelRot(partialTick));
-        vehicle.setRightWheelRot(snap.animRightWheelRot(partialTick));
-        vehicle.setLeftWheelRotO(snap.prevAnimation.leftWheelRot);
-        vehicle.setRightWheelRotO(snap.prevAnimation.rightWheelRot);
-        vehicle.setLeftTrack(snap.animLeftTrack(partialTick));
-        vehicle.setRightTrack(snap.animRightTrack(partialTick));
-        vehicle.setLeftTrackO(snap.prevAnimation.leftTrack);
-        vehicle.setRightTrackO(snap.prevAnimation.rightTrack);
+        vehicle.setLeftWheelRot(snap.animLeftWheelRot(1.0F));
+        vehicle.setRightWheelRot(snap.animRightWheelRot(1.0F));
+        vehicle.setLeftWheelRotO(snap.animLeftWheelRot(0.0F));
+        vehicle.setRightWheelRotO(snap.animRightWheelRot(0.0F));
+        vehicle.setLeftTrack(snap.animLeftTrack(1.0F));
+        vehicle.setRightTrack(snap.animRightTrack(1.0F));
+        vehicle.setLeftTrackO(snap.animLeftTrack(0.0F));
+        vehicle.setRightTrackO(snap.animRightTrack(0.0F));
 
-        vehicle.setPropellerRot(snap.animPropellerRot(partialTick));
-        vehicle.setPropellerRotO(snap.prevAnimation.propellerRot);
-        vehicle.setSynchedPropellerRot(snap.animPropellerRot(partialTick));
-        vehicle.setSynchedGearRot(snap.animGearRot(partialTick));
-        vehicle.setGearRot(snap.animGearRot(partialTick));
+        vehicle.setPropellerRot(snap.animPropellerRot(1.0F));
+        vehicle.setPropellerRotO(snap.animPropellerRot(0.0F));
+        vehicle.setSynchedPropellerRot(snap.animPropellerRot(1.0F));
+        vehicle.setSynchedGearRot(snap.animGearRot(1.0F));
+        vehicle.setGearRot(snap.animGearRot(1.0F));
         vehicle.setPlaneBreak(snap.animPlaneBreak(partialTick));
 
         vehicle.setCannonRecoilTime(snap.animCannonRecoilTime());
