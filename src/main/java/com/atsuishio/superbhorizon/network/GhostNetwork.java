@@ -20,10 +20,16 @@ import java.util.Optional;
 import java.util.UUID;
 import java.util.function.Supplier;
 
+/**
+ * サーバー・クライアント間のゴースト車両情報のネットワーク通信を統括するクラス。
+ * パケットの定義、エンコード、デコード、およびスレッドセーフなパケット処理（ハンドラー）を内包します。
+ */
 public class GhostNetwork {
 
+    // ネットワークプロトコルのバージョン定義
     private static final String PROTOCOL = "4";
 
+    // パケット配信用チャンネルの生成
     public static final SimpleChannel CHANNEL = NetworkRegistry.newSimpleChannel(
             ResourceLocation.fromNamespaceAndPath(SuperbHorizon.MODID, "ghost"),
             () -> PROTOCOL,
@@ -33,6 +39,9 @@ public class GhostNetwork {
 
     private static int nextId = 0;
 
+    /**
+     * パケット一覧をネットワークチャンネルへ登録します。
+     */
     public static void register() {
         CHANNEL.registerMessage(nextId++, LoadPacket.class,
                 LoadPacket::encode, LoadPacket::decode, LoadPacket::handle,
@@ -51,12 +60,18 @@ public class GhostNetwork {
                 Optional.of(NetworkDirection.PLAY_TO_CLIENT));
     }
 
+    /**
+     * 指定ディメンション（ワールドレベル）のすべてのプレイヤーへパケットを一斉送信します。
+     */
     public static void sendToLevel(Object packet, ServerLevel level) {
         for (ServerPlayer player : level.players()) {
             sendToServerPlayer(packet, player);
         }
     }
 
+    /**
+     * 指定地点から一定距離内にいるプレイヤーに対してのみパケットを送信します（送信トラフィックの削減）。
+     */
     public static void sendToLevelNear(Object packet, ServerLevel level, double x, double y, double z, double maxDistance) {
         if (maxDistance <= 0.0D) {
             sendToLevel(packet, level);
@@ -71,6 +86,9 @@ public class GhostNetwork {
         }
     }
 
+    /**
+     * 特定のプレイヤーへパケットを送信します。
+     */
     public static void sendToPlayer(Object message, Player player) {
         if (player instanceof ServerPlayer serverPlayer) {
             sendToServerPlayer(message, serverPlayer);
@@ -81,13 +99,16 @@ public class GhostNetwork {
         CHANNEL.send(PacketDistributor.PLAYER.with(() -> player), message);
     }
 
+    /**
+     * 車両の特定時点における位置・角度・アニメーション情報を保持するシリアライズ用スナップショットクラス。
+     */
     public static class GhostSnapshot {
-        public final int entityId;
-        public final UUID vehicleId;
-        public final String typeKey;
-        public final double x, y, z;
-        public final float yaw, pitch, roll;
-        public final GhostAnimationState animation;
+        public final int entityId;               // サーバー側の実EntityID
+        public final UUID vehicleId;             // 車両の固有UUID
+        public final String typeKey;             // 車両の種類 (RegistryName)
+        public final double x, y, z;             // 絶対座標
+        public final float yaw, pitch, roll;     // 車体の向き角度
+        public final GhostAnimationState animation; // 車両の可動パーツのアニメーション情報
 
         public GhostSnapshot(int entityId, UUID vehicleId, String typeKey,
                              double x, double y, double z,
@@ -134,7 +155,11 @@ public class GhostNetwork {
         }
     }
 
+    /**
+     * 車両の各種可動部分（砲塔、ローター、ギア、主砲リコイル、スピード等）のアニメーションパラメータを束ねたクラス。
+     */
     public static class GhostAnimationState {
+        // 空のアニメーション定義（静止車両用など）
         public static final GhostAnimationState EMPTY = new GhostAnimationState(
                 0.0F, 0.0F, 0.0F,
                 0.0F, 0.0F, 0.0F, 0.0F,
@@ -143,23 +168,23 @@ public class GhostNetwork {
                 0.0F, 0
         );
 
-        public final float absoluteSpeed;
-        public final float targetSpeed;
-        public final float power;
-        public final float turretYaw;
-        public final float turretPitch;
-        public final float gunYaw;
-        public final float gunPitch;
-        public final float leftWheelRot;
-        public final float rightWheelRot;
-        public final float leftTrack;
-        public final float rightTrack;
-        public final float propellerRot;
-        public final float gearRot;
-        public final float planeBreak;
-        public final int cannonRecoilTime;
-        public final float cannonRecoilForce;
-        public final int flags;
+        public final float absoluteSpeed;     // 車体の実速度
+        public final float targetSpeed;       // 車体の目標速度
+        public final float power;             // エンジン出力
+        public final float turretYaw;         // 砲塔の回転（ヨー）
+        public final float turretPitch;       // 砲塔の上下（ピッチ）
+        public final float gunYaw;             // 銃身の回転（ヨー）
+        public final float gunPitch;           // 銃身の上下（ピッチ）
+        public final float leftWheelRot;      // 左タイヤの回転角
+        public final float rightWheelRot;     // 右タイヤの回転角
+        public final float leftTrack;         // 左クローラー（無限軌道）の移動量
+        public final float rightTrack;        // 右クローラー（無限軌道）の移動量
+        public final float propellerRot;      // プロペラ/ローターの回転角
+        public final float gearRot;           // 着陸ギアの昇降角度
+        public final float planeBreak;        // フラップ/ブレードなどの制動変位
+        public final int cannonRecoilTime;    // 主砲のリコイル残存時間（Tick）
+        public final float cannonRecoilForce; // 主砲のリコイル力
+        public final int flags;               // ブーリアン状態フラグのビット列
 
         public GhostAnimationState(
                 float absoluteSpeed,
@@ -197,6 +222,8 @@ public class GhostNetwork {
             this.cannonRecoilForce = cannonRecoilForce;
             this.flags = flags;
         }
+
+        // --- フラグビットマスクに基づく状態確認用ヘルパーメソッド群 ---
 
         public boolean engineRunning() {
             return (flags & 1) != 0;
@@ -249,6 +276,9 @@ public class GhostNetwork {
         }
     }
 
+    /**
+     * クライアント側のゴーストキャッシュを一斉クリアするためのパケット。
+     */
     public static class ClearPacket {
         public static void encode(ClearPacket pkt, FriendlyByteBuf buf) {
         }
@@ -267,6 +297,9 @@ public class GhostNetwork {
         }
     }
 
+    /**
+     * クライアント側に特定のゴースト車両を新規に「ロード」させるパケット。
+     */
     public static class LoadPacket extends GhostSnapshot {
         public LoadPacket(int entityId, UUID vehicleId, String typeKey,
                           double x, double y, double z,
@@ -301,9 +334,12 @@ public class GhostNetwork {
         }
     }
 
+    /**
+     * ディメンション移動時などに、現在ディメンション内のゴースト車両群を一斉に再ロードさせる一括同期パケット。
+     */
     public static class BatchLoadPacket {
-        public final boolean clearFirst;
-        public final List<GhostSnapshot> snapshots;
+        public final boolean clearFirst;            // 読込前に既存キャッシュをクリアするか
+        public final List<GhostSnapshot> snapshots; // ロードする全車両のデータリスト
 
         public BatchLoadPacket(boolean clearFirst, List<GhostSnapshot> snapshots) {
             this.clearFirst = clearFirst;
@@ -338,8 +374,11 @@ public class GhostNetwork {
         }
     }
 
+    /**
+     * クライアント側に特定のゴースト車両を「アンロード（消去）」させるためのパケット。
+     */
     public static class UnloadPacket {
-        public final UUID vehicleId;
+        public final UUID vehicleId; // 消去対象の車両UUID
 
         public UnloadPacket(UUID vehicleId) {
             this.vehicleId = vehicleId;
@@ -363,6 +402,9 @@ public class GhostNetwork {
         }
     }
 
+    /**
+     * 稼働中のゴースト車両の位置、向き、可動パーツアニメーション状態を更新するための定期Tickパケット。
+     */
     public static class TickPacket extends GhostSnapshot {
         public TickPacket(int entityId, UUID vehicleId, String typeKey,
                           double x, double y, double z,

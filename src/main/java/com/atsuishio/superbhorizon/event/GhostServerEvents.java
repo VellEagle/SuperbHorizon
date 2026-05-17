@@ -1,5 +1,6 @@
 package com.atsuishio.superbhorizon.event;
 
+import com.atsuishio.superbhorizon.SuperbHorizon;
 import com.atsuishio.superbhorizon.SuperbHorizonConfig;
 import com.atsuishio.superbhorizon.network.GhostNetwork;
 import com.atsuishio.superbwarfare.entity.vehicle.base.VehicleEntity;
@@ -24,12 +25,22 @@ import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 
-@Mod.EventBusSubscriber(bus = Mod.EventBusSubscriber.Bus.FORGE)
+/**
+ * サーバー側でビークルの発生・消失・移動を監視し、付近のクライアントへ
+ * 状態同期パケットを配信するイベントリスナークラス。
+ */
+@Mod.EventBusSubscriber(modid = SuperbHorizon.MODID, bus = Mod.EventBusSubscriber.Bus.FORGE)
 public class GhostServerEvents {
 
+    // ディメンションごとに、現在ワールドに実在してアクティブに動いているビークル実体の一覧を管理します
     private static final Map<ResourceKey<Level>, Map<UUID, VehicleEntity>> ACTIVE_VEHICLES = new HashMap<>();
+    
+    // 直前のTickにおいて各クライアントに送信したアニメーション状態のキャッシュ（冗長なパケット送信を抑止するため）
     private static final Map<ResourceKey<Level>, Map<UUID, GhostNetwork.GhostAnimationState>> LAST_ANIMATION_STATES = new HashMap<>();
 
+    /**
+     * プレイヤーがサーバーにログインした際、すでに存在するすべてのゴースト車両データを一括同期します。
+     */
     @SubscribeEvent
     public static void onPlayerLogin(PlayerEvent.PlayerLoggedInEvent event) {
         if (event.getEntity() instanceof ServerPlayer player) {
@@ -37,6 +48,10 @@ public class GhostServerEvents {
         }
     }
 
+    /**
+     * プレイヤーが別のディメンション（ネザーやエンドなど）にテレポートした際、
+     * 移動先のディメンションに存在するゴースト車両データを再同期します。
+     */
     @SubscribeEvent
     public static void onPlayerChangedDimension(PlayerEvent.PlayerChangedDimensionEvent event) {
         if (event.getEntity() instanceof ServerPlayer player) {
@@ -44,6 +59,9 @@ public class GhostServerEvents {
         }
     }
 
+    /**
+     * プレイヤーが死亡してリスポーンした際、周辺のゴースト車両の状態を再送信します。
+     */
     @SubscribeEvent
     public static void onPlayerRespawn(PlayerEvent.PlayerRespawnEvent event) {
         if (event.getEntity() instanceof ServerPlayer player) {
@@ -51,6 +69,10 @@ public class GhostServerEvents {
         }
     }
 
+    /**
+     * サーバーワールドに車両エンティティ（VehicleEntity）がスポーンまたはロードされた際に呼び出されます。
+     * アクティブリストに車両を追加し、付近のクライアントへロード用パケットを即座にブロードキャストします。
+     */
     @SubscribeEvent
     public static void onEntityJoin(EntityJoinLevelEvent event) {
         if (event.getLevel().isClientSide() || !(event.getEntity() instanceof VehicleEntity vehicle)) return;
@@ -60,19 +82,28 @@ public class GhostServerEvents {
 
         String typeKey = typeKey(vehicle);
         GhostSavedData data = GhostSavedData.get(serverLevel);
+        
+        // ワールドの永続化データに新規登録
         data.vehicleMap.put(vehicle.getUUID(), new GhostSavedData.GhostEntry(
                 typeKey, vehicle.getX(), vehicle.getY(), vehicle.getZ(), vehicle.getYRot(), vehicle.getXRot(), vehicle.getRoll()
         ));
         data.setDirty();
+        
+        // 現在のアニメーション状態を取得・記録
         GhostNetwork.GhostAnimationState animation = captureAnimationState(vehicle);
         rememberAnimationState(serverLevel, vehicle.getUUID(), animation);
 
+        // 周辺のプレイヤーへ新車両ロードを通知
         GhostNetwork.sendToLevelNear(new GhostNetwork.LoadPacket(
                 vehicle.getId(), vehicle.getUUID(), typeKey, vehicle.getX(), vehicle.getY(), vehicle.getZ(),
                 vehicle.getYRot(), vehicle.getXRot(), vehicle.getRoll(), animation
         ), serverLevel, vehicle.getX(), vehicle.getY(), vehicle.getZ(), SuperbHorizonConfig.MAX_SYNC_DISTANCE.get());
     }
 
+    /**
+     * 車両エンティティがワールドから離脱（破壊、デスポーン、アンロード）した際に呼び出されます。
+     * 実体が完全にゲームから削除（破壊・破棄）された場合は、ゴーストデータも削除しアンロード用パケットを通知します。
+     */
     @SubscribeEvent
     public static void onEntityLeave(EntityLeaveLevelEvent event) {
         if (event.getLevel().isClientSide() || !(event.getEntity() instanceof VehicleEntity vehicle)) return;
@@ -82,6 +113,7 @@ public class GhostServerEvents {
         forgetAnimationState(serverLevel, vehicle.getUUID());
 
         Entity.RemovalReason reason = vehicle.getRemovalReason();
+        // 車両が完全に破壊または破棄された場合のみデータを永続リストから削除し、ゴーストも消去します
         if (reason == Entity.RemovalReason.KILLED || reason == Entity.RemovalReason.DISCARDED) {
             GhostSavedData data = GhostSavedData.get(serverLevel);
             data.vehicleMap.remove(vehicle.getUUID());
@@ -96,10 +128,16 @@ public class GhostServerEvents {
         }
     }
 
+    /**
+     * サーバーワールドがティック進行するたびに呼び出されます。
+     * 設定された TICK_INTERVAL 周期ごとに稼働中のすべての車両の座標・回転・アニメーションに「意味のある変化」があるかを走査し、
+     * 変化があった場合または定期ハートビート時に最新の状態パケットを配信します。
+     */
     @SubscribeEvent
     public static void onLevelTick(TickEvent.LevelTickEvent event) {
         if (event.phase != TickEvent.Phase.END || event.level.isClientSide()) return;
 
+        // 同期Tick周期チェック
         int tickInterval = SuperbHorizonConfig.TICK_INTERVAL.get();
         if (event.level.getGameTime() % tickInterval != 0) return;
 
@@ -117,6 +155,8 @@ public class GhostServerEvents {
         while (iterator.hasNext()) {
             Map.Entry<UUID, VehicleEntity> activeEntry = iterator.next();
             VehicleEntity vehicle = activeEntry.getValue();
+            
+            // 使用不可能（削除済みなど）な実体はリストから除外
             if (!isUsableVehicle(serverLevel, vehicle)) {
                 iterator.remove();
                 continue;
@@ -131,13 +171,19 @@ public class GhostServerEvents {
                 data.setDirty();
             }
 
+            // 位置・角度に目立った変更があるか検証
             boolean changed = hasMeaningfulChange(entry, vehicle);
+            
+            // アニメーション状態をキャプチャし変化があるか検証
             GhostNetwork.GhostAnimationState animation = captureAnimationState(vehicle);
             boolean animationChanged = hasAnimationChanged(serverLevel, vehicle.getUUID(), animation);
+            
+            // データを最新にアップデート
             entry.typeKey = typeKey;
             entry.x = vehicle.getX(); entry.y = vehicle.getY(); entry.z = vehicle.getZ();
             entry.yaw = vehicle.getYRot(); entry.pitch = vehicle.getXRot(); entry.roll = vehicle.getRoll();
 
+            // 変化が発生したか、定期ハートビートのタイミングであればクライアントにTickUpdateパケットを送信
             if (changed || animationChanged || shouldHeartbeat) {
                 GhostNetwork.sendToLevelNear(new GhostNetwork.TickPacket(
                         vehicle.getId(), vehicle.getUUID(), typeKey, vehicle.getX(), vehicle.getY(), vehicle.getZ(),
@@ -146,12 +192,16 @@ public class GhostServerEvents {
                 rememberAnimationState(serverLevel, vehicle.getUUID(), animation);
             }
 
+            // 変更があり、かつ保存周期であれば保存フラグを汚す
             if ((changed || animationChanged) && shouldSave) {
                 data.setDirty();
             }
         }
     }
 
+    /**
+     * 新しくスポーン/ログインしたプレイヤーに対し、周囲にあるゴースト車両を一括初期化送信（BatchLoadPacket）します。
+     */
     private static void syncPlayer(ServerPlayer player) {
         ServerLevel serverLevel = player.serverLevel();
         GhostSavedData data = GhostSavedData.get(serverLevel);
@@ -160,6 +210,7 @@ public class GhostServerEvents {
         double maxDistanceSq = maxDistance * maxDistance;
 
         data.vehicleMap.forEach((uuid, entry) -> {
+            // 最大同期距離フィルター
             if (maxDistance > 0.0D && player.distanceToSqr(entry.x, entry.y, entry.z) > maxDistanceSq) {
                 return;
             }
@@ -174,6 +225,7 @@ public class GhostServerEvents {
             ));
         });
 
+        // プレイヤーにバッチロードメッセージを送信
         GhostNetwork.sendToPlayer(new GhostNetwork.BatchLoadPacket(true, snapshots), player);
     }
 
@@ -217,6 +269,9 @@ public class GhostServerEvents {
                 && vehicle.getRemovalReason() == null;
     }
 
+    /**
+     * 前回の記録データから、有意な位置または回転の変化（しきい値超え）が発生したかを判定します。
+     */
     private static boolean hasMeaningfulChange(GhostSavedData.GhostEntry entry, VehicleEntity vehicle) {
         double positionEpsilonSq = SuperbHorizonConfig.POSITION_EPSILON.get() * SuperbHorizonConfig.POSITION_EPSILON.get();
         double dx = entry.x - vehicle.getX();
@@ -230,6 +285,9 @@ public class GhostServerEvents {
                 || Math.abs(Mth.wrapDegrees(entry.roll - vehicle.getRoll())) > rotationEpsilon;
     }
 
+    /**
+     * 直前の同期タイミングから、アニメーションのプロパティ（速度、タイヤ回転、主砲角度など）に有意な変化が発生したかを検証します。
+     */
     private static boolean hasAnimationChanged(ServerLevel level, UUID uuid, GhostNetwork.GhostAnimationState current) {
         Map<UUID, GhostNetwork.GhostAnimationState> states = LAST_ANIMATION_STATES.get(level.dimension());
         GhostNetwork.GhostAnimationState previous = states != null ? states.get(uuid) : null;
@@ -255,6 +313,9 @@ public class GhostServerEvents {
                 || previous.flags != current.flags;
     }
 
+    /**
+     * 車両エンティティから、現在の駆動スピード、アニメーションパラメータ、状態フラグを一括で抽出・キャプチャします。
+     */
     private static GhostNetwork.GhostAnimationState captureAnimationState(VehicleEntity vehicle) {
         int flags = 0;
         if (vehicle.engineRunning()) flags |= 1;
