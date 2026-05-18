@@ -286,6 +286,12 @@ public class VehicleGhostRenderer {
         dummy.setXRot(snap.renderPitch(1.0F));
         dummy.yRotO = snap.renderYaw(0.0F);
         dummy.xRotO = snap.renderPitch(0.0F);
+
+        if (dummy instanceof VehicleEntity vehicle) {
+            vehicle.setRoll(snap.renderRoll(1.0F));
+            vehicle.setPrevRoll(snap.renderRoll(0.0F));
+        }
+
         applyAnimationState(dummy, snap, partialTick);
 
         var renderer = mc.getEntityRenderDispatcher().getRenderer(dummy);
