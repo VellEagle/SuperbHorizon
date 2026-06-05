@@ -10,35 +10,51 @@ public class SuperbHorizonConfig {
     public static final ForgeConfigSpec SPEC;
 
     // --- 同期に関する設定項目 (Sync Config) ---
-    
-    // パケットをサーバーからクライアントに送信する時間間隔（サーバーTick数）
     public static final ForgeConfigSpec.IntValue TICK_INTERVAL;
-    
-    // 動いているゴーストデータをチャンク保存用にマークする時間間隔（サーバーTick数）
     public static final ForgeConfigSpec.IntValue SAVE_INTERVAL;
-    
-    // 位置パケットを送信する最小の座標変化量（メートル）
     public static final ForgeConfigSpec.DoubleValue POSITION_EPSILON;
-    
-    // 回転角度パケットを送信する最小の角度変化量（度数）
     public static final ForgeConfigSpec.DoubleValue ROTATION_EPSILON;
-    
-    // ゴーストパケットを同期するプレイヤーからの最大半径距離（この距離より遠いと同期しない）
     public static final ForgeConfigSpec.DoubleValue MAX_SYNC_DISTANCE;
 
     // --- 描画に関する設定項目 (Render Config) ---
-    
-    // ゴースト描画（VehicleGhostRenderer）と通常エンティティ描画が切り替わる境界距離
     public static final ForgeConfigSpec.DoubleValue GHOST_SWITCH_DISTANCE;
-    
-    // クライアント側でパケットが途絶えた際、何Tickでゴーストを非表示にするかの生存時間
     public static final ForgeConfigSpec.IntValue STALE_TICKS;
-    
-    // PolyMeshリフレクションレンダラーを有効にするかどうか
     public static final ForgeConfigSpec.BooleanValue ENABLE_POLYMESH;
-    
-    // アニメーションデータが存在する場合、ゴースト描画にSuperb Warfare本来のエンティティレンダラーを優先するか
     public static final ForgeConfigSpec.BooleanValue PREFER_ANIMATED_ENTITY_FALLBACK;
+
+    // --- LOD (Level of Detail) に関する設定項目 ---
+
+    /**
+     * フルモデル描画（アニメーション・テクスチャあり）を行う最大距離。
+     * この距離より遠いゴーストはアニメーションなしの静的モデルに切り替わります。
+     * GHOST_SWITCH_DISTANCE より大きい値にする必要があります。
+     * 0 に設定すると LOD を無効化し、すべての距離でフルモデルを描画します。
+     */
+    public static final ForgeConfigSpec.DoubleValue LOD_FULL_DISTANCE;
+
+    /**
+     * 静的モデルを描画する最大距離（メートル）。
+     * この距離より遠いゴーストは描画を完全にスキップします。
+     * LOD_FULL_DISTANCE より大きい値にする必要があります。
+     * 0 に設定するとこのカリングを無効化します。
+     */
+    public static final ForgeConfigSpec.DoubleValue LOD_STATIC_DISTANCE;
+
+    /**
+     * 静的LOD（アニメなし）のゴーストを N フレームに 1 回だけ描画するフレームスキップ数。
+     * 1 でスキップなし、2 で 1 フレームおきに描画（実効 30fps@60fps）、
+     * 4 で 3 フレームおきに描画（実効 15fps@60fps）。
+     * 遠距離の静的ゴーストはほとんど動きが見えないため、4〜6 程度でも違和感がありません。
+     */
+    public static final ForgeConfigSpec.IntValue STATIC_FRAME_SKIP;
+
+    /**
+     * 一度に描画するゴーストの最大台数。
+     * 大量の車両が視界に入っているときの描画負荷を上限で制御します。
+     * 0 で無制限。
+     */
+    public static final ForgeConfigSpec.IntValue MAX_GHOST_COUNT;
+
 
     static {
         ForgeConfigSpec.Builder builder = new ForgeConfigSpec.Builder();
@@ -58,7 +74,7 @@ public class SuperbHorizonConfig {
                 .defineInRange("rotationEpsilon", 0.25D, 0.0D, 10.0D);
         MAX_SYNC_DISTANCE = builder
                 .comment("ゴースト同期を行うプレイヤーからの最大同期距離。0に設定すると距離フィルタリングを無効化します。")
-                .defineInRange("maxSyncDistance", 4096.0D, 0.0D, 32000.0D);
+                .defineInRange("maxSyncDistance", 5000.0D, 0.0D, 32000.0D);
         builder.pop();
 
         builder.push("render");
@@ -74,6 +90,29 @@ public class SuperbHorizonConfig {
         PREFER_ANIMATED_ENTITY_FALLBACK = builder
                 .comment("アニメーションデータが利用可能な場合、遠距離のゴースト描画にSuperb Warfareのアニメーション対応エンティティレンダラーを優先使用するか。")
                 .define("preferAnimatedEntityFallback", true);
+        builder.pop();
+
+        builder.push("lod");
+        builder.comment(
+                "--- LOD (Level of Detail) 設定 ---\n" +
+                "距離に応じてゴーストの描画精度・頻度を段階的に落とし、クライアントの描画負荷を削減します。\n" +
+                "  ・GHOST_SWITCH_DISTANCE 以内    → 通常エンティティレンダラー（ゴーストOFF）\n" +
+                "  ・LOD_FULL_DISTANCE 以内        → フルモデル（アニメーション・テクスチャあり、毎フレーム描画）\n" +
+                "  ・LOD_STATIC_DISTANCE 以内      → 静的モデル（バインドポーズ固定・アニメなし、フレームスキップあり）\n" +
+                "  ・LOD_STATIC_DISTANCE 超        → 描画スキップ（完全カリング）");
+        LOD_FULL_DISTANCE = builder
+                .comment("フルアニメーションモデルを描画する最大距離（メートル）。これより遠いゴーストはアニメーションなしの静止モデルになります。0でLOD段階を無効化します。")
+                .defineInRange("lodFullDistance", 5000.0D, 0.0D, 32000.0D);
+        LOD_STATIC_DISTANCE = builder
+                .comment("静的モデルを描画する最大距離（メートル）。これより遠いゴーストは描画を完全にスキップします。0で無制限（スキップなし）。推奨: LOD_FULL_DISTANCE の 2〜3 倍程度。")
+                .defineInRange("lodStaticDistance", 5000.0D, 0.0D, 32000.0D);
+        STATIC_FRAME_SKIP = builder
+                .comment("静的LODゴーストを N フレームに 1 回だけ描画するフレームスキップ数。1=毎フレーム（デフォルト・推奨）。2以上にすると点滅が発生するため、現状は1のまま使用してください。")
+                .defineInRange("staticFrameSkip", 1, 1, 16);
+        MAX_GHOST_COUNT = builder
+                .comment("一度に描画するゴーストの最大台数。視界内にゴーストが多すぎるときの上限制御。0で無制限。")
+                .defineInRange("maxGhostCount", 20, 0, 512);
+
         builder.pop();
 
         SPEC = builder.build();

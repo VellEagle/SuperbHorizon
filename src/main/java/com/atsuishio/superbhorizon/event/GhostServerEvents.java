@@ -24,6 +24,7 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.Collection;
 
 /**
  * サーバー側でビークルの発生・消失・移動を監視し、付近のクライアントへ
@@ -137,9 +138,9 @@ public class GhostServerEvents {
     public static void onLevelTick(TickEvent.LevelTickEvent event) {
         if (event.phase != TickEvent.Phase.END || event.level.isClientSide()) return;
 
-        // 同期Tick周期チェック
-        int tickInterval = SuperbHorizonConfig.TICK_INTERVAL.get();
-        if (event.level.getGameTime() % tickInterval != 0) return;
+        // 最小同期周期チェック（TICK_INTERVALより細かい周期では絶対に処理しない）
+        int baseInterval = SuperbHorizonConfig.TICK_INTERVAL.get();
+        if (event.level.getGameTime() % baseInterval != 0) return;
 
         ServerLevel serverLevel = (ServerLevel) event.level;
         Map<UUID, VehicleEntity> active = ACTIVE_VEHICLES.get(serverLevel.dimension());
@@ -148,14 +149,19 @@ public class GhostServerEvents {
         GhostSavedData data = GhostSavedData.get(serverLevel);
         boolean shouldSave = event.level.getGameTime() % SuperbHorizonConfig.SAVE_INTERVAL.get() == 0;
         int staleTicks = SuperbHorizonConfig.STALE_TICKS.get();
-        int heartbeatInterval = staleTicks > 0 ? Math.max(SuperbHorizonConfig.TICK_INTERVAL.get(), staleTicks / 2) : 0;
+        int heartbeatInterval = staleTicks > 0 ? Math.max(baseInterval, staleTicks / 2) : 0;
         boolean shouldHeartbeat = heartbeatInterval > 0 && event.level.getGameTime() % heartbeatInterval == 0;
+
+        // プレイヤーリストをあらかじめ取得（ループ内で毎回取得しないようにする）
+        List<ServerPlayer> players = new java.util.ArrayList<>(serverLevel.players());
+
+        long gameTime = event.level.getGameTime();
 
         Iterator<Map.Entry<UUID, VehicleEntity>> iterator = active.entrySet().iterator();
         while (iterator.hasNext()) {
             Map.Entry<UUID, VehicleEntity> activeEntry = iterator.next();
             VehicleEntity vehicle = activeEntry.getValue();
-            
+
             // 使用不可能（削除済みなど）な実体はリストから除外
             if (!isUsableVehicle(serverLevel, vehicle)) {
                 iterator.remove();
@@ -173,24 +179,50 @@ public class GhostServerEvents {
 
             // 位置・角度に目立った変更があるか検証
             boolean changed = hasMeaningfulChange(entry, vehicle);
-            
+
             // アニメーション状態をキャプチャし変化があるか検証
             GhostNetwork.GhostAnimationState animation = captureAnimationState(vehicle);
             boolean animationChanged = hasAnimationChanged(serverLevel, vehicle.getUUID(), animation);
-            
+
             // データを最新にアップデート
             entry.typeKey = typeKey;
             entry.x = vehicle.getX(); entry.y = vehicle.getY(); entry.z = vehicle.getZ();
             entry.yaw = vehicle.getYRot(); entry.pitch = vehicle.getXRot(); entry.roll = vehicle.getRoll();
 
-            // 変化が発生したか、定期ハートビートのタイミングであればクライアントにTickUpdateパケットを送信
-            if (changed || animationChanged || shouldHeartbeat) {
-                GhostNetwork.sendToLevelNear(new GhostNetwork.TickPacket(
-                        vehicle.getId(), vehicle.getUUID(), typeKey, vehicle.getX(), vehicle.getY(), vehicle.getZ(),
-                        vehicle.getYRot(), vehicle.getXRot(), vehicle.getRoll(), animation
-                ), serverLevel, vehicle.getX(), vehicle.getY(), vehicle.getZ(), SuperbHorizonConfig.MAX_SYNC_DISTANCE.get());
-                rememberAnimationState(serverLevel, vehicle.getUUID(), animation);
+            // 変化がない・ハートビートでもない場合はパケット送信自体をスキップ
+            if (!changed && !animationChanged && !shouldHeartbeat) continue;
+
+            // 変化があった場合：プレイヤーごとに距離バケットで送信頻度を変える
+            GhostNetwork.TickPacket packet = new GhostNetwork.TickPacket(
+                    vehicle.getId(), vehicle.getUUID(), typeKey,
+                    vehicle.getX(), vehicle.getY(), vehicle.getZ(),
+                    vehicle.getYRot(), vehicle.getXRot(), vehicle.getRoll(), animation);
+
+            double maxSyncDist = SuperbHorizonConfig.MAX_SYNC_DISTANCE.get();
+            double maxSyncDistSq = maxSyncDist > 0 ? maxSyncDist * maxSyncDist : Double.MAX_VALUE;
+
+            for (ServerPlayer player : players) {
+                double distSq = player.distanceToSqr(vehicle.getX(), vehicle.getY(), vehicle.getZ());
+
+                // MAX_SYNC_DISTANCE 外のプレイヤーへは送らない
+                if (distSq > maxSyncDistSq) continue;
+
+                // ── 距離バケット別の送信間隔 ──────────────────────────────────
+                // 近距離（～500m）: baseInterval ごと（通常頻度、変化があれば必ず送る）
+                // 中距離（500～1500m）: baseInterval×4 ごと
+                // 遠距離（1500m～）: baseInterval×12 ごと（ハートビートは距離問わず通す）
+                // ──────────────────────────────────────────────────────────────
+                if (distSq > 1500.0 * 1500.0) {
+                    if (!shouldHeartbeat && (gameTime / baseInterval) % 12 != 0) continue;
+                } else if (distSq > 500.0 * 500.0) {
+                    if (!shouldHeartbeat && (gameTime / baseInterval) % 4 != 0) continue;
+                }
+                // 近距離は変化がある限り毎 baseInterval 送信（上の if で continue されないのでそのまま通る）
+
+                GhostNetwork.sendToPlayer(packet, player);
             }
+
+            rememberAnimationState(serverLevel, vehicle.getUUID(), animation);
 
             // 変更があり、かつ保存周期であれば保存フラグを汚す
             if ((changed || animationChanged) && shouldSave) {
