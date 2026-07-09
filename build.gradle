@@ -86,7 +86,7 @@ minecraft {
             }
         }
 
-        client1 {
+        client {
             workingDirectory project.file('run/client1')
 
             property 'forge.enabledGameTestNamespaces', mod_id
@@ -95,6 +95,7 @@ minecraft {
         }
 
         client2 {
+            parent runs.client
             workingDirectory project.file('run/client2')
 
             property 'forge.enabledGameTestNamespaces', mod_id

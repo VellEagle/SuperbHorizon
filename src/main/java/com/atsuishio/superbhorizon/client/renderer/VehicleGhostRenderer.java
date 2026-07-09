@@ -4,10 +4,7 @@ import com.atsuishio.superbhorizon.SuperbHorizonConfig;
 import com.atsuishio.superbhorizon.network.GhostNetwork;
 import com.atsuishio.superbwarfare.entity.vehicle.base.VehicleEntity;
 import com.mojang.blaze3d.systems.RenderSystem;
-import com.mojang.blaze3d.vertex.BufferBuilder;
 import com.mojang.blaze3d.vertex.PoseStack;
-import com.mojang.blaze3d.vertex.Tesselator;
-import com.mojang.blaze3d.vertex.VertexSorting;
 import com.mojang.logging.LogUtils;
 import com.mojang.math.Axis;
 import net.minecraft.client.Camera;
@@ -21,6 +18,7 @@ import net.minecraft.world.phys.Vec3;
 import net.minecraftforge.api.distmarker.Dist;
 import net.minecraftforge.client.event.ClientPlayerNetworkEvent;
 import net.minecraftforge.client.event.RenderLevelStageEvent;
+import net.minecraftforge.event.TickEvent;
 import net.minecraftforge.event.entity.EntityJoinLevelEvent;
 import net.minecraftforge.eventbus.api.SubscribeEvent;
 import net.minecraftforge.fml.common.Mod;
@@ -29,7 +27,6 @@ import com.atsuishio.superbwarfare.entity.vehicle.DroneEntity;
 import com.atsuishio.superbwarfare.init.ModItems;
 import com.atsuishio.superbwarfare.tools.EntityFindUtil;
 import net.minecraft.world.item.ItemStack;
-import org.joml.Matrix4f;
 import org.slf4j.Logger;
 
 import java.lang.reflect.Field;
@@ -61,8 +58,6 @@ public class VehicleGhostRenderer {
     private static boolean reflectionInitialized = false;
     private static boolean reflectionAvailable = false;
 
-    private static final float FAR_PLANE = 32000.0F;
-
     // フレームスキップカウンター（STATICゴーストのフレーム間引き用）
     private static int globalFrameCounter = 0;
 
@@ -73,13 +68,11 @@ public class VehicleGhostRenderer {
     private static final class CachedStaticFrame {
         final double x, y, z;
         final float yaw;
-        CachedStaticFrame(double x, double y, double z, float yaw) {
-            this.x = x; this.y = y; this.z = z; this.yaw = yaw;
+        final boolean far;
+        CachedStaticFrame(double x, double y, double z, float yaw, boolean far) {
+            this.x = x; this.y = y; this.z = z; this.yaw = yaw; this.far = far;
         }
     }
-
-    // 再利用可能な描画バッファ（毎フレームのGCアロケーションを排除）
-    private static MultiBufferSource.BufferSource sharedIsolatedBuffers = null;
 
     /**
      * LODレベルの定義。
@@ -121,9 +114,7 @@ public class VehicleGhostRenderer {
         clearSnapshots();
         polyMeshCache.clear();
         loggedRenderFailures.clear();
-        sharedIsolatedBuffers = null;
         globalFrameCounter = 0;
-        staticFrameCache.clear();
     }
 
     @SubscribeEvent
@@ -131,6 +122,17 @@ public class VehicleGhostRenderer {
         if (event.getLevel().isClientSide()) {
             VehicleGhostData snap = snapshots.get(event.getEntity().getUUID());
             if (snap != null) snap.entityId = event.getEntity().getId();
+        }
+    }
+
+    // dummyEntitiesはワールドの通常のtickループに乗らないため、tickCountが常に0のまま固定される。
+    // 車両レンダラーがtickCount依存のアイドルアニメーション（サスペンションの揺れ等）を持つ場合、
+    // 実車両では正常に再生されるのにゴーストだけ固まって見える原因になるため、ここで手動で進める。
+    @SubscribeEvent
+    public static void onClientTick(TickEvent.ClientTickEvent event) {
+        if (event.phase != TickEvent.Phase.END) return;
+        for (Entity dummy : dummyEntities.values()) {
+            if (dummy != null) dummy.tickCount++;
         }
     }
 
@@ -154,12 +156,17 @@ public class VehicleGhostRenderer {
         double ghostSwitchDist    = Math.min(clientRenderDistance, SuperbHorizonConfig.GHOST_SWITCH_DISTANCE.get());
         double ghostSwitchDistSq  = ghostSwitchDist * ghostSwitchDist;
 
+        // 通常の描画距離（vanillaのfar plane相当）を超えるゴーストだけ、圧縮描画パスを使う。
+        // この範囲内であれば、既存のdepthバッファ（同じ投影行列で書き込み済み）とGPUのdepth testが
+        // そのまま正しく機能するため、ブロックによる遮蔽も追加のレイキャストなしで正しく処理される。
+        double vanillaFarDistSq = clientRenderDistance * clientRenderDistance;
+
         // ドローン操縦中はプレイヤーの体の座標とカメラ座標が大きく離れる。
         // このとき「プレイヤーから近い＝通常レンダラーで描く」というスキップ判定が
         // ドローンカメラ視点での描画を正しく行えなくさせるため、
         // ドローン操縦中は ghostSwitchDistSq チェックを無効化する。
         boolean isDroneCamera = false;
-        java.util.UUID linkedDroneUuid = null;
+        UUID linkedDroneUuid = null;
         ItemStack heldStack = mc.player.getMainHandItem();
         if (heldStack.is(ModItems.MONITOR.get())
                 && heldStack.getOrCreateTag().getBoolean("Using")
@@ -183,103 +190,181 @@ public class VehicleGhostRenderer {
         int maxGhosts       = SuperbHorizonConfig.MAX_GHOST_COUNT.get();
         int staticFrameSkip = SuperbHorizonConfig.STATIC_FRAME_SKIP.get();
 
-        if (sharedIsolatedBuffers == null) {
-            BufferBuilder builder = Tesselator.getInstance().getBuilder();
-            sharedIsolatedBuffers = MultiBufferSource.immediate(builder);
+        // 通常のエンティティ描画と同じ共有バッファを使う（自前のisolatedバッファは使わない）。
+        MultiBufferSource.BufferSource buffers = mc.renderBuffers().bufferSource();
+
+        // 描画リスト構築
+        List<CandidateEntry> candidates = new ArrayList<>(snapshots.size());
+
+        for (VehicleGhostData snap : snapshots.values()) {
+            if (snap.isStale()) continue;
+
+            Entity realEntity = mc.level.getEntity(snap.entityId);
+            // ドローン操縦中はカメラがドローン座標にあるため、プレイヤー体付近の
+            // チャンクロード済み車両はFrustum外になり通常レンダラーが描かない。
+            // その場合 realEntity が存在してもゴーストとして描く必要があるため、
+            // isDroneCamera のときは realEntity チェックをスキップする。
+            // ただし操縦中のドローン自身はカメラ直下に実体があり通常レンダラーが描くため、
+            // ゴーストとして重複描画しないようにスキップする。
+            boolean isLinkedDrone = isDroneCamera
+                    && linkedDroneUuid != null
+                    && linkedDroneUuid.equals(snap.vehicleId);
+            if (isLinkedDrone) continue;
+
+            // realEntity が「クライアントに存在する」ことと「実際にvanillaが描画してくれる」ことは
+            // 別物。vanilla側の距離カリングはghostSwitchDistより近いことが多いが保証はなく、
+            // プレイヤーが素早く離れる（クリエイティブ飛行等）とエンティティがまだ
+            // クライアント側でアンロードされていない「死角」区間が生じ、
+            // realEntity!=nullでゴーストをスキップしたのにvanillaは距離的に描画しない
+            // ＝どちらも描画されず消える、という不具合になる。
+            // そのためこの2条件は独立したcontinueではなく、
+            // 「realEntityが存在し、かつghostSwitchDist圏内（＝確実にvanillaの描画範囲）」
+            // の場合にのみゴーストをスキップするようにする。
+            boolean realEntityPresent = !isDroneCamera && realEntity != null && !realEntity.isRemoved();
+            boolean withinGhostSwitchDist = false;
+            if (!isDroneCamera) {
+                double distSqFromPlayer = mc.player.distanceToSqr(snap.x, snap.y, snap.z);
+                withinGhostSwitchDist = distSqFromPlayer < ghostSwitchDistSq;
+            }
+            if (realEntityPresent && withinGhostSwitchDist) continue;
+
+            // LOD・カリング判定はカメラ座標（ドローン操縦時はドローン位置）を基準にする
+            double dx = snap.x - camPos.x;
+            double dy = snap.y - camPos.y;
+            double dz = snap.z - camPos.z;
+            double distSq = dx * dx + dy * dy + dz * dz;
+
+            // STATIC距離外は描画スキップ
+            if (staticCullEnabled && distSq > lodStaticDistSq) continue;
+
+            boolean isFar = distSq > vanillaFarDistSq;
+
+            LodLevel lod;
+            if (lodEnabled && distSq > lodFullDistSq) {
+                lod = LodLevel.STATIC;
+                if (staticFrameSkip > 1) {
+                    int offset = Math.abs(snap.vehicleId.hashCode()) % staticFrameSkip;
+                    if ((globalFrameCounter + offset) % staticFrameSkip != 0) {
+                        // スキップフレーム：前回のキャッシュがあればそれで描画して点滅を防ぐ
+                        CachedStaticFrame cached = staticFrameCache.get(snap.vehicleId);
+                        if (cached != null) {
+                            candidates.add(new CandidateEntry(snap, distSq, LodLevel.STATIC_CACHED, cached, cached.far));
+                        }
+                        continue;
+                    }
+                }
+                // 描画フレーム：キャッシュを更新
+                staticFrameCache.put(snap.vehicleId, new CachedStaticFrame(snap.x, snap.y, snap.z, snap.yaw, isFar));
+            } else {
+                lod = LodLevel.FULL;
+            }
+
+            candidates.add(new CandidateEntry(snap, distSq, lod, null, isFar));
         }
 
-        Matrix4f oldProj   = RenderSystem.getProjectionMatrix();
-        float oldFogStart  = RenderSystem.getShaderFogStart();
-        float oldFogEnd    = RenderSystem.getShaderFogEnd();
+        // 台数上限：カメラに近い順にソートして遠いものを落とす
+        if (maxGhosts > 0 && candidates.size() > maxGhosts) {
+            candidates.sort(Comparator.comparingDouble(e -> e.distSq));
+            candidates = candidates.subList(0, maxGhosts);
+        }
 
+        // --- 近距離パス：投影行列に一切手を加えない。既存のdepthバッファと完全に整合するため、
+        //     ブロックによる遮蔽もGPUのdepth testだけで正しく処理される。 ---
+        for (CandidateEntry entry : candidates) {
+            if (entry.far) continue;
+            renderCandidate(entry, ps, buffers, partialTick, camPos, mc, gameTime, 0.0);
+        }
+        buffers.endBatch();
+
+        // --- 遠距離パス：通常の描画距離を超えたゴーストは、投影行列を一切変更せず、
+        //     カメラからの方向を保ったまま近距離へ「圧縮」して描画する。見た目の大きさが
+        //     変わらないよう同じ比率でモデルも縮小する（本物の投影行列・depthバッファ・
+        //     PoseStackのbobbingとバイト単位で完全に一致するため、遠距離での投影行列
+        //     すり替えが原因だったbobbingのズレとdepthの不整合が起きない）。
+        //
+        //     圧縮距離はDistant HorizonsのVanilla Fade（near clip plane付近でvanillaと
+        //     DHのLODをdepthバッファだけで滑らかに繋ぐ後処理シェーダー、fadeStart/fadeEndは
+        //     おおよそ70～100ブロック程度）の範囲を明確に避けて、確実にvanilla描画のみが
+        //     行われる近距離に固定する。この帯に入ると高速移動時に明滅・透明化して見える。
+        //
+        //     フォグだけは通常どおり伸ばして、圧縮位置がフォグで消えないようにする。 ---
+        boolean hasFar = false;
+        for (CandidateEntry entry : candidates) {
+            if (entry.far) { hasFar = true; break; }
+        }
+        if (hasFar) {
+            double compressedRenderDist = Math.min(clientRenderDistance * 0.5, 40.0);
+            float oldFogStart = RenderSystem.getShaderFogStart();
+            float oldFogEnd   = RenderSystem.getShaderFogEnd();
+            try {
+                // fogStartとfogEndを同じ値にすると線形フォグの計算式 (fogEnd - depth) / (fogEnd - fogStart)
+                // が0除算になり、透明度が不安定になって明滅する。十分な幅を持たせて0除算を避ける。
+                RenderSystem.setShaderFogStart((float) (compressedRenderDist * 4.0));
+                RenderSystem.setShaderFogEnd((float) (compressedRenderDist * 8.0));
+
+                for (CandidateEntry entry : candidates) {
+                    if (!entry.far) continue;
+                    renderCandidate(entry, ps, buffers, partialTick, camPos, mc, gameTime, compressedRenderDist);
+                }
+            } finally {
+                buffers.endBatch();
+                RenderSystem.setShaderFogStart(oldFogStart);
+                RenderSystem.setShaderFogEnd(oldFogEnd);
+            }
+        }
+    }
+
+    private static void renderCandidate(
+            CandidateEntry entry,
+            PoseStack ps,
+            MultiBufferSource.BufferSource buffers,
+            float partialTick,
+            Vec3 camPos,
+            Minecraft mc,
+            long gameTime,
+            double compressedRenderDist) {
+        if (compressedRenderDist <= 0.0) {
+            if (entry.lod == LodLevel.STATIC_CACHED) {
+                // スキップフレーム：キャッシュされた位置・向きで静的に描画（補間なし）
+                renderStaticCached(entry.snap, entry.cached, ps, buffers, camPos, mc);
+            } else {
+                entry.snap.prepareFrame(gameTime, partialTick);
+                renderSnapshot(entry.snap, ps, buffers, partialTick, camPos, mc, entry.lod);
+            }
+            return;
+        }
+
+        // 遠距離：実際の位置の代わりに、カメラからの方向を保ったまま
+        // compressedRenderDist まで近づけた「圧縮位置」を求め、同じ比率でモデルを縮小する。
+        Vec3 truePos;
+        if (entry.lod == LodLevel.STATIC_CACHED) {
+            truePos = new Vec3(entry.cached.x, entry.cached.y, entry.cached.z);
+        } else {
+            entry.snap.prepareFrame(gameTime, partialTick);
+            truePos = new Vec3(entry.snap.renderX(partialTick), entry.snap.renderY(partialTick), entry.snap.renderZ(partialTick));
+        }
+
+        double actualDist = Math.sqrt(entry.distSq);
+        if (actualDist < 1.0) actualDist = 1.0;
+        Vec3 dir = truePos.subtract(camPos).scale(1.0 / actualDist);
+        Vec3 compressedPos = camPos.add(dir.scale(compressedRenderDist));
+        float scale = (float) (compressedRenderDist / actualDist);
+
+        ps.pushPose();
         try {
-            float fov    = (float) (2.0 * Math.atan(1.0 / oldProj.m11()));
-            float aspect = oldProj.m11() / oldProj.m00();
-            Matrix4f hugeProj = new Matrix4f().setPerspective(fov, aspect, 0.6F, FAR_PLANE);
-            RenderSystem.setProjectionMatrix(hugeProj, VertexSorting.DISTANCE_TO_ORIGIN);
-            RenderSystem.setShaderFogStart(FAR_PLANE);
-            RenderSystem.setShaderFogEnd(FAR_PLANE);
+            ps.translate(compressedPos.x - camPos.x, compressedPos.y - camPos.y, compressedPos.z - camPos.z);
+            ps.scale(scale, scale, scale);
 
-            // 描画リスト構築
-            List<CandidateEntry> candidates = new ArrayList<>(snapshots.size());
-
-            for (VehicleGhostData snap : snapshots.values()) {
-                if (snap.isStale()) continue;
-
-                Entity realEntity = mc.level.getEntity(snap.entityId);
-                // ドローン操縦中はカメラがドローン座標にあるため、プレイヤー体付近の
-                // チャンクロード済み車両はFrustum外になり通常レンダラーが描かない。
-                // その場合 realEntity が存在してもゴーストとして描く必要があるため、
-                // isDroneCamera のときは realEntity チェックをスキップする。
-                // ただし操縦中のドローン自身はカメラ直下に実体があり通常レンダラーが描くため、
-                // ゴーストとして重複描画しないようにスキップする。
-                boolean isLinkedDrone = isDroneCamera
-                        && linkedDroneUuid != null
-                        && linkedDroneUuid.equals(snap.vehicleId);
-                if (isLinkedDrone) continue;
-                if (!isDroneCamera && realEntity != null && !realEntity.isRemoved()) continue;
-
-                // ghostSwitchDist チェック（近距離スキップ）はプレイヤー座標基準のまま維持し、
-                // 通常エンティティレンダラーとの二重描画を避ける。
-                // ただしドローン操縦中はカメラ位置がプレイヤーの体から大きく離れるため
-                // このスキップを無効化し、ドローン視点から全ゴーストを描画できるようにする。
-                if (!isDroneCamera) {
-                    double distSqFromPlayer = mc.player.distanceToSqr(snap.x, snap.y, snap.z);
-                    if (distSqFromPlayer < ghostSwitchDistSq) continue;
-                }
-
-                // LOD・カリング判定はカメラ座標（ドローン操縦時はドローン位置）を基準にする
-                double dx = snap.x - camPos.x;
-                double dy = snap.y - camPos.y;
-                double dz = snap.z - camPos.z;
-                double distSq = dx * dx + dy * dy + dz * dz;
-
-                // STATIC距離外は描画スキップ
-                if (staticCullEnabled && distSq > lodStaticDistSq) continue;
-
-                LodLevel lod;
-                if (lodEnabled && distSq > lodFullDistSq) {
-                    lod = LodLevel.STATIC;
-                    if (staticFrameSkip > 1) {
-                        int offset = Math.abs(snap.vehicleId.hashCode()) % staticFrameSkip;
-                        if ((globalFrameCounter + offset) % staticFrameSkip != 0) {
-                            // スキップフレーム：前回のキャッシュがあればそれで描画して点滅を防ぐ
-                            CachedStaticFrame cached = staticFrameCache.get(snap.vehicleId);
-                            if (cached != null) {
-                                candidates.add(new CandidateEntry(snap, distSq, LodLevel.STATIC_CACHED, cached));
-                            }
-                            continue;
-                        }
-                    }
-                    // 描画フレーム：キャッシュを更新
-                    staticFrameCache.put(snap.vehicleId, new CachedStaticFrame(snap.x, snap.y, snap.z, snap.yaw));
-                } else {
-                    lod = LodLevel.FULL;
-                }
-
-                candidates.add(new CandidateEntry(snap, distSq, lod, null));
-            }
-
-            // 台数上限：カメラに近い順にソートして遠いものを落とす
-            if (maxGhosts > 0 && candidates.size() > maxGhosts) {
-                candidates.sort(Comparator.comparingDouble(e -> e.distSq));
-                candidates = candidates.subList(0, maxGhosts);
-            }
-
-            for (CandidateEntry entry : candidates) {
-                if (entry.lod == LodLevel.STATIC_CACHED) {
-                    // スキップフレーム：キャッシュされた位置・向きで静的に描画（補間なし）
-                    renderStaticCached(entry.snap, entry.cached, ps, sharedIsolatedBuffers, camPos, mc);
-                } else {
-                    entry.snap.prepareFrame(gameTime, partialTick);
-                    renderSnapshot(entry.snap, ps, sharedIsolatedBuffers, partialTick, camPos, mc, entry.lod);
-                }
+            // truePos を「仮のカメラ座標」として渡すことで、各描画メソッド内の
+            // (renderX(partialTick) - camPos.x) 計算が 0 になり、上で移動・縮小した
+            // 現在のPoseStackの原点にそのままモデルが描かれる。
+            if (entry.lod == LodLevel.STATIC_CACHED) {
+                renderStaticCached(entry.snap, entry.cached, ps, buffers, truePos, mc);
+            } else {
+                renderSnapshot(entry.snap, ps, buffers, partialTick, truePos, mc, entry.lod);
             }
         } finally {
-            sharedIsolatedBuffers.endBatch();
-            RenderSystem.setProjectionMatrix(oldProj, VertexSorting.DISTANCE_TO_ORIGIN);
-            RenderSystem.setShaderFogStart(oldFogStart);
-            RenderSystem.setShaderFogEnd(oldFogEnd);
+            ps.popPose();
         }
     }
 
@@ -298,30 +383,31 @@ public class VehicleGhostRenderer {
             MultiBufferSource.BufferSource buffers,
             Vec3 camPos,
             Minecraft mc) {
-        ps.pushPose();
         try {
-            ps.translate(cached.x - camPos.x, cached.y - camPos.y, cached.z - camPos.z);
-            if (!tryRenderPolyMeshCached(snap, cached, ps, buffers, mc.level)) {
-                renderStaticDummyEntityCached(snap, cached, ps, buffers, mc);
+            if (!tryRenderPolyMeshCachedAt(snap, cached, ps, buffers, camPos, mc.level)) {
+                renderStaticDummyEntityCached(snap, cached, ps, buffers, camPos, mc);
             }
         } catch (Exception e) {
             logRenderFailureOnce("cached:" + snap.typeKey, "Failed to render cached ghost " + snap.typeKey, e);
-        } finally {
-            ps.popPose();
         }
     }
 
-    private static boolean tryRenderPolyMeshCached(
+    private static boolean tryRenderPolyMeshCachedAt(
             VehicleGhostData snap,
             CachedStaticFrame cached,
             PoseStack ps,
             MultiBufferSource.BufferSource buffers,
+            Vec3 camPos,
             Level level) {
-        // STATIC_CACHED パスも tryRenderPolyMeshStatic に統一し、
-        // cached.yaw をスナップショットに反映してから描画する。
-        // snap.yaw は renderStaticCached の呼び出し元でキャッシュ時の値が入っているため
-        // そのまま tryRenderPolyMeshStatic に渡せる。
-        return tryRenderPolyMeshStatic(snap, ps, buffers, level);
+        ps.pushPose();
+        try {
+            ps.translate(cached.x - camPos.x, cached.y - camPos.y, cached.z - camPos.z);
+            // STATIC_CACHED パスも tryRenderPolyMeshStatic に統一し、
+            // cached.yaw をスナップショットに反映してから描画する。
+            return tryRenderPolyMeshStatic(snap, ps, buffers, level);
+        } finally {
+            ps.popPose();
+        }
     }
 
     private static void renderStaticDummyEntityCached(
@@ -329,6 +415,7 @@ public class VehicleGhostRenderer {
             CachedStaticFrame cached,
             PoseStack ps,
             MultiBufferSource.BufferSource buffers,
+            Vec3 camPos,
             Minecraft mc) {
         Entity dummy = getOrCreateDummy(snap, mc);
         if (dummy == null) return;
@@ -339,10 +426,11 @@ public class VehicleGhostRenderer {
         if (dummy instanceof VehicleEntity vehicle) {
             vehicle.setRoll(0.0F); vehicle.setPrevRoll(0.0F);
         }
-        var renderer = mc.getEntityRenderDispatcher().getRenderer(dummy);
-        if (renderer != null) {
-            renderer.render(dummy, cached.yaw, 1.0f, ps, buffers, snap.getCachedPackedLight(mc.level));
-        }
+        if (mc.getEntityRenderDispatcher().getRenderer(dummy) == null) return;
+        mc.getEntityRenderDispatcher().render(
+                dummy,
+                cached.x - camPos.x, cached.y - camPos.y, cached.z - camPos.z,
+                cached.yaw, 1.0f, ps, buffers, snap.getCachedPackedLight(mc.level));
     }
 
     private static void renderSnapshot(
@@ -353,21 +441,15 @@ public class VehicleGhostRenderer {
             Vec3 camPos,
             Minecraft mc,
             LodLevel lod) {
-        ps.pushPose();
         try {
-            ps.translate(
-                    snap.renderX(partialTick) - camPos.x,
-                    snap.renderY(partialTick) - camPos.y,
-                    snap.renderZ(partialTick) - camPos.z);
-
             if (lod == LodLevel.FULL) {
                 // フルモデル：アニメーションあり
                 if (snap.hasAnimationState() && SuperbHorizonConfig.PREFER_ANIMATED_ENTITY_FALLBACK.get()) {
-                    if (!renderDummyEntity(snap, ps, buffers, partialTick, mc)) {
-                        tryRenderPolyMesh(snap, ps, buffers, partialTick, mc.level, false);
+                    if (!renderDummyEntity(snap, ps, buffers, partialTick, camPos, mc)) {
+                        tryRenderPolyMeshAt(snap, ps, buffers, partialTick, camPos, mc.level, false);
                     }
-                } else if (!tryRenderPolyMesh(snap, ps, buffers, partialTick, mc.level, false)) {
-                    renderDummyEntity(snap, ps, buffers, partialTick, mc);
+                } else if (!tryRenderPolyMeshAt(snap, ps, buffers, partialTick, camPos, mc.level, false)) {
+                    renderDummyEntity(snap, ps, buffers, partialTick, camPos, mc);
                 }
             } else {
                 // STATICモデル：アニメなし（バインドポーズ固定）
@@ -375,20 +457,38 @@ public class VehicleGhostRenderer {
                 // これにより SMC 等のメッシュレンダラー（TrackPath 計算など）が
                 // 静的ゴーストのために実行されることを防ぐ。
                 // PolyMesh が使えない場合のみ軽量化した静的 DummyEntity 描画にフォールバック。
-                if (!tryRenderPolyMeshStatic(snap, ps, buffers, mc.level)) {
-                    renderStaticDummyEntity(snap, ps, buffers, partialTick, mc);
+                if (!tryRenderPolyMeshStaticAt(snap, ps, buffers, camPos, mc.level)) {
+                    renderStaticDummyEntity(snap, ps, buffers, partialTick, camPos, mc);
                 }
             }
         } catch (Exception e) {
             logRenderFailureOnce("snapshot:" + snap.typeKey, "Failed to render ghost vehicle " + snap.typeKey, e);
-        } finally {
-            ps.popPose();
         }
     }
 
     // -------------------------------------------------------------------------
     // PolyMesh 描画
     // -------------------------------------------------------------------------
+
+    private static boolean tryRenderPolyMeshAt(
+            VehicleGhostData snap,
+            PoseStack ps,
+            MultiBufferSource.BufferSource buffers,
+            float partialTick,
+            Vec3 camPos,
+            Level level,
+            boolean staticPose) {
+        ps.pushPose();
+        try {
+            ps.translate(
+                    snap.renderX(partialTick) - camPos.x,
+                    snap.renderY(partialTick) - camPos.y,
+                    snap.renderZ(partialTick) - camPos.z);
+            return tryRenderPolyMesh(snap, ps, buffers, partialTick, level, staticPose);
+        } finally {
+            ps.popPose();
+        }
+    }
 
     private static boolean tryRenderPolyMesh(
             VehicleGhostData snap,
@@ -412,6 +512,24 @@ public class VehicleGhostRenderer {
         }
 
         return doRenderMesh(mesh, snap, ps, buffers, partialTick, level, staticPose);
+    }
+
+    private static boolean tryRenderPolyMeshStaticAt(
+            VehicleGhostData snap,
+            PoseStack ps,
+            MultiBufferSource.BufferSource buffers,
+            Vec3 camPos,
+            Level level) {
+        ps.pushPose();
+        try {
+            ps.translate(
+                    snap.renderX(1.0F) - camPos.x,
+                    snap.renderY(1.0F) - camPos.y,
+                    snap.renderZ(1.0F) - camPos.z);
+            return tryRenderPolyMeshStatic(snap, ps, buffers, level);
+        } finally {
+            ps.popPose();
+        }
     }
 
     /**
@@ -440,7 +558,6 @@ public class VehicleGhostRenderer {
             if (mesh == null) return false;
         }
 
-        ps.pushPose();
         try {
             // バインドポーズを適用（アニメーションなし固定）
             Object bindPose = bindPoseField.get(mesh);
@@ -456,8 +573,6 @@ public class VehicleGhostRenderer {
             logRenderFailureOnce("polyStatic:" + snap.typeKey,
                     "PolyMesh static render failed for " + snap.typeKey + "; falling back to entity renderer", e);
             return false;
-        } finally {
-            ps.popPose();
         }
     }
 
@@ -479,7 +594,6 @@ public class VehicleGhostRenderer {
             float partialTick,
             Level level,
             boolean staticPose) {
-        ps.pushPose();
         try {
             Object bindPose = bindPoseField.get(mesh);
             applyPoseMethod.invoke(mesh, bindPose);
@@ -496,8 +610,6 @@ public class VehicleGhostRenderer {
         } catch (Exception e) {
             logRenderFailureOnce("poly:" + snap.typeKey, "PolyMesh render failed for " + snap.typeKey + "; falling back to entity renderer", e);
             return false;
-        } finally {
-            ps.popPose();
         }
     }
 
@@ -514,7 +626,8 @@ public class VehicleGhostRenderer {
     }
 
     // -------------------------------------------------------------------------
-    // DummyEntity 描画（フル・アニメーションあり）
+    // DummyEntity 描画（EntityRenderDispatcher.render() 経由。実エンティティの描画と
+    // 完全に同じ経路を通すことで、姿勢・オフセット計算のズレを防ぐ）
     // -------------------------------------------------------------------------
 
     private static boolean renderDummyEntity(
@@ -522,6 +635,7 @@ public class VehicleGhostRenderer {
             PoseStack ps,
             MultiBufferSource.BufferSource buffers,
             float partialTick,
+            Vec3 camPos,
             Minecraft mc) {
         Entity dummy = getOrCreateDummy(snap, mc);
         if (dummy == null) return false;
@@ -540,20 +654,22 @@ public class VehicleGhostRenderer {
             vehicle.setPrevRoll(snap.renderRoll(0.0F));
         }
 
+        if (mc.getEntityRenderDispatcher().getRenderer(dummy) == null) return false;
+
         applyAnimationState(dummy, snap, partialTick);
 
-        var renderer = mc.getEntityRenderDispatcher().getRenderer(dummy);
-        if (renderer != null) {
-            renderer.render(dummy, snap.renderYaw(partialTick), partialTick, ps, buffers,
-                    snap.getCachedPackedLight(mc.level));
-            return true;
-        }
-        return false;
+        mc.getEntityRenderDispatcher().render(
+                dummy,
+                snap.renderX(partialTick) - camPos.x,
+                snap.renderY(partialTick) - camPos.y,
+                snap.renderZ(partialTick) - camPos.z,
+                snap.renderYaw(partialTick),
+                partialTick,
+                ps,
+                buffers,
+                snap.getCachedPackedLight(mc.level));
+        return true;
     }
-
-    // -------------------------------------------------------------------------
-    // DummyEntity 描画（静的・アニメなし）
-    // -------------------------------------------------------------------------
 
     /**
      * 静的LOD描画用。applyAnimationState() を呼ばないことでアニメーション計算コストをゼロにします。
@@ -564,6 +680,7 @@ public class VehicleGhostRenderer {
             PoseStack ps,
             MultiBufferSource.BufferSource buffers,
             float partialTick,
+            Vec3 camPos,
             Minecraft mc) {
         Entity dummy = getOrCreateDummy(snap, mc);
         if (dummy == null) return false;
@@ -582,13 +699,19 @@ public class VehicleGhostRenderer {
             vehicle.setPrevRoll(0.0F);
         }
 
-        var renderer = mc.getEntityRenderDispatcher().getRenderer(dummy);
-        if (renderer != null) {
-            renderer.render(dummy, snap.renderYaw(partialTick), partialTick, ps, buffers,
-                    snap.getCachedPackedLight(mc.level));
-            return true;
-        }
-        return false;
+        if (mc.getEntityRenderDispatcher().getRenderer(dummy) == null) return false;
+
+        mc.getEntityRenderDispatcher().render(
+                dummy,
+                snap.renderX(partialTick) - camPos.x,
+                snap.renderY(partialTick) - camPos.y,
+                snap.renderZ(partialTick) - camPos.z,
+                snap.renderYaw(partialTick),
+                partialTick,
+                ps,
+                buffers,
+                snap.getCachedPackedLight(mc.level));
+        return true;
     }
 
     private static Entity getOrCreateDummy(VehicleGhostData snap, Minecraft mc) {
@@ -640,11 +763,13 @@ public class VehicleGhostRenderer {
         final double distSq;
         final LodLevel lod;
         final CachedStaticFrame cached; // STATIC_CACHEDのときのみ非null
-        CandidateEntry(VehicleGhostData snap, double distSq, LodLevel lod, CachedStaticFrame cached) {
+        final boolean far; // 通常の描画距離を超えているか（圧縮描画パスを使うか）
+        CandidateEntry(VehicleGhostData snap, double distSq, LodLevel lod, CachedStaticFrame cached, boolean far) {
             this.snap = snap;
             this.distSq = distSq;
             this.lod = lod;
             this.cached = cached;
+            this.far = far;
         }
     }
 

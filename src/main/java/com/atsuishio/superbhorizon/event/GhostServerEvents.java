@@ -149,7 +149,11 @@ public class GhostServerEvents {
         GhostSavedData data = GhostSavedData.get(serverLevel);
         boolean shouldSave = event.level.getGameTime() % SuperbHorizonConfig.SAVE_INTERVAL.get() == 0;
         int staleTicks = SuperbHorizonConfig.STALE_TICKS.get();
-        int heartbeatInterval = staleTicks > 0 ? Math.max(baseInterval, staleTicks / 2) : 0;
+        // staleTicksの半分だと、失効までの猶予にheartbeatが1回しか収まらず、
+        // 高速移動中のネットワーク輻輳（チャンク送信の急増等）で1パケットでも
+        // 遅延・欠落すると即座にゴーストが消えてしまう。4分の1にして猶予内に
+        // 複数回heartbeatが収まるようにし、単発のパケット遅延に強くする。
+        int heartbeatInterval = staleTicks > 0 ? Math.max(baseInterval, staleTicks / 4) : 0;
         boolean shouldHeartbeat = heartbeatInterval > 0 && event.level.getGameTime() % heartbeatInterval == 0;
 
         // プレイヤーリストをあらかじめ取得（ループ内で毎回取得しないようにする）
