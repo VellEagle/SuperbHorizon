@@ -86,7 +86,7 @@ minecraft {
             }
         }
 
-        client1 {
+        client {
             workingDirectory project.file('run/client1')
 
             property 'forge.enabledGameTestNamespaces', mod_id
@@ -95,6 +95,7 @@ minecraft {
         }
 
         client2 {
+            parent runs.client
             workingDirectory project.file('run/client2')
 
             property 'forge.enabledGameTestNamespaces', mod_id
@@ -140,6 +141,12 @@ repositories {
         }
     }
 
+    maven {
+        name = "Modrinth"
+        url = "https://api.modrinth.com/maven"
+        content { includeGroup "maven.modrinth" }
+    }
+
 
     maven {
 
@@ -180,9 +187,11 @@ dependencies {
     // compileOnly fg.deobf("mezz.jei:jei-${mc_version}-forge-api:${jei_version}")
     // runtimeOnly fg.deobf("mezz.jei:jei-${mc_version}-forge:${jei_version}")
 
-    implementation fg.deobf("curse.maven:distant-horizons-508933:8037629")
+    implementation fg.deobf("curse.maven:distant-horizons-508933:8389142")
 
-    implementation fg.deobf("curse.maven:superb-warfare-1218165:8046997")
+    implementation fg.deobf("curse.maven:superb-warfare-1218165:9019882")
+
+    compileOnly "maven.modrinth:distanthorizonsapi:4.0.1"
 
     implementation fg.deobf("curse.maven:kotlin-for-forge-351264:5402061")
 
