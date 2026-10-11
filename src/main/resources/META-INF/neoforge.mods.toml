@@ -1,0 +1,34 @@
+modLoader = "javafml"
+loaderVersion = "[4,)"
+license = "LGPL-3.0-only"
+issueTrackerURL = "https://github.com/VellEagle"
+
+[[mods]]
+modId = "superbhorizons"
+version = "1.0.0"
+displayName = "Superb Horizons"
+authors = "VellEagle"
+description = '''
+Superb Horizons renders vehicles from Superb Warfare as ghost models even when they are beyond the normal draw distance. This mod is intended to be used in conjunction with distant horizons.'''
+
+[[dependencies.superbhorizons]]
+modId = "neoforge"
+type = "required"
+versionRange = "[21.1,)"
+ordering = "NONE"
+side = "BOTH"
+
+[[dependencies.superbhorizons]]
+modId = "minecraft"
+type = "required"
+versionRange = "[1.21.1,1.22)"
+ordering = "NONE"
+side = "BOTH"
+
+# Superb Warfare 本体 (1.20.1 版と同じく「任意」扱い。無くても起動は止まりません)
+[[dependencies.superbhorizons]]
+modId = "superbwarfare"
+type = "optional"
+versionRange = "[0,)"
+ordering = "AFTER"
+side = "BOTH"
