@@ -1,36 +1,37 @@
 modLoader="javafml"
-loaderVersion="${loader_version_range}"
-license="GPL-V3.0"
+loaderVersion="[47,)"
+license="LGPL-3.0-only"
+issueTrackerURL="https://github.com/VellEagle"
 
 [[mods]]
-modId="superbhorizon"
-version="0.1.1"
+modId="superbhorizons"
+version="1.0.0"
 displayName="Superb Horizons"
-authors = "VellEagle"
-logoFile = "sbhlogo.png"
-displayURL = "https://www.curseforge.com/minecraft/mc-mods/superb-horizons"
-description='''This mod allows vehicle entities in Superb Warfare to be displayed as ghost models even when they are outside the draw distance.'''
+authors="VellEagle"
+description='''
+Superb Horizons renders vehicles from Superb Warfare as ghost models even when they are beyond the normal draw distance. This mod is intended to be used in conjunction with distant horizons.
+'''
 
-# SuperbWarfare dependency
-[[dependencies.${mod_id}]]
-    modId="superbwarfare"
-    mandatory=true
-    versionRange="[0.8.0,)"
-    ordering="AFTER"
-    side="BOTH"
-
-# Forge dependency
-[[dependencies.${mod_id}]]
+[[dependencies.superbhorizons]]
     modId="forge"
     mandatory=true
-    versionRange="${forge_version_range}"
+    versionRange="[47,)"
     ordering="NONE"
     side="BOTH"
 
-# Minecraft dependency
-[[dependencies.${mod_id}]]
+[[dependencies.superbhorizons]]
     modId="minecraft"
     mandatory=true
-    versionRange="${minecraft_version_range}"
+    versionRange="[1.20.1,1.21)"
     ordering="NONE"
+    side="BOTH"
+
+# Superb Warfare 本体。mandatory=false にしてあるので、
+# SBW の modId が違っていても起動が止まることはありません。
+# 正しい modId が確認できたら mandatory=true にしてください。
+[[dependencies.superbhorizons]]
+    modId="superbwarfare"
+    mandatory=false
+    versionRange="[0,)"
+    ordering="AFTER"
     side="BOTH"
