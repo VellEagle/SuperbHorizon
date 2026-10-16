@@ -3,6 +3,8 @@ plugins {
     id 'idea'
     id 'maven-publish'
     id 'net.minecraftforge.gradle' version '[6.0,6.2)'
+    // Mixin (本物の車両が実際に描かれたかの記録に使います)
+    id 'org.spongepowered.mixin' version '0.7.+'
 }
 
 version = mod_version
@@ -173,7 +175,16 @@ repositories {
     // }
 }
 
+// Mixin の設定 (refmap は難読化された本番環境で Mixin の割り込み先を見つけるための対応表です)
+mixin {
+    add sourceSets.main, 'superbhorizons.refmap.json'
+    config 'superbhorizons.mixins.json'
+}
+
 dependencies {
+    // Mixin の refmap を作るための処理
+    annotationProcessor 'org.spongepowered:mixin:0.8.5:processor'
+
     // Specify the version of Minecraft to use.
     // Any artifact can be supplied so long as it has a "userdev" classifier artifact and is a compatible patcher artifact.
     // The "userdev" classifier will be requested and setup by ForgeGradle.
@@ -247,7 +258,8 @@ tasks.named('jar', Jar).configure {
                 'Implementation-Title'    : project.name,
                 'Implementation-Version'  : project.jar.archiveVersion,
                 'Implementation-Vendor'   : mod_authors,
-                'Implementation-Timestamp': new Date().format("yyyy-MM-dd'T'HH:mm:ssZ")
+                'Implementation-Timestamp': new Date().format("yyyy-MM-dd'T'HH:mm:ssZ"),
+                'MixinConfigs'            : 'superbhorizons.mixins.json'
         ])
     }
 

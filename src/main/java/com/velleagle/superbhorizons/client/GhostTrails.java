@@ -73,7 +73,7 @@ public final class GhostTrails {
 
             // 本物の弾が描かれているなら、SBW 本体が煙を出します。
             if (GhostRenderer.removedBySbw(level, g, cam)) continue;   // SBW が既に消した弾
-            if (GhostRenderer.isRealEntityShown(level, g, cam)) continue;
+            if (GhostRenderer.realEntityDrawsItself(level, g, cam)) continue;
 
             Rule rule = ruleFor(g, level);
             if (rule.style == null) continue;

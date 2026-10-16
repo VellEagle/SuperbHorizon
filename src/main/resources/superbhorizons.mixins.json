@@ -1,0 +1,13 @@
+{
+  "required": false,
+  "minVersion": "0.8",
+  "package": "com.velleagle.superbhorizons.mixin",
+  "compatibilityLevel": "JAVA_17",
+  "refmap": "superbhorizons.refmap.json",
+  "client": [
+    "LevelRendererMixin"
+  ],
+  "injectors": {
+    "defaultRequire": 0
+  }
+}
