@@ -51,6 +51,9 @@ public class VehicleTracker {
 
     private static int tickCounter = 0;
 
+    /** 【デバッグ用】プレイヤーごとに、最後に送信内容をログに出した時刻。 */
+    private static final Map<UUID, Long> DEBUG_LAST_LOG = new HashMap<>();
+
     // ------------------------------------------------------------------
     // 車両の登録 / 削除
     // ------------------------------------------------------------------
@@ -223,14 +226,25 @@ public class VehicleTracker {
                 Map<Integer, long[]> sentBefore = GUN_DATA_SENT.getOrDefault(player.getUUID(), Map.of());
                 Map<Integer, long[]> sentNow = new HashMap<>();
 
+                // 【デバッグ用】送らなかった車両の数 (debugLog = true のときだけログに出します)
+                int dbgTooClose = 0, dbgTooFar = 0, dbgBadType = 0;
                 for (Entity v : vehicles) {
                     double dSqr = v.distanceToSqr(player.getX(), player.getY(), player.getZ());
                     // 近すぎる車両は本物のエンティティが描画するので送らない
-                    if (dSqr < minDistSqr) continue;
-                    if (dSqr > maxDistSqr) continue;
+                    if (dSqr < minDistSqr) {
+                        dbgTooClose++;
+                        continue;
+                    }
+                    if (dSqr > maxDistSqr) {
+                        dbgTooFar++;
+                        continue;
+                    }
 
                     int typeId = BuiltInRegistries.ENTITY_TYPE.getId(v.getType());
-                    if (typeId < 0) continue;
+                    if (typeId < 0) {
+                        dbgBadType++;
+                        continue;
+                    }
 
                     // 可動部分の状態。遠すぎる車両では通信量を抑えるため送りません。
                     GhostAnimation animation = null;
@@ -273,6 +287,7 @@ public class VehicleTracker {
                     entries.add(entry);
                 }
 
+                int dbgBeforeCap = entries.size();
                 // 台数が多すぎる場合は近い順に打ち切る
                 if (entries.size() > maxCount) {
                     entries.sort((a, bb) -> Double.compare(
@@ -284,6 +299,30 @@ public class VehicleTracker {
                     sentNow.keySet().retainAll(kept);
                 }
                 GUN_DATA_SENT.put(player.getUUID(), sentNow);
+
+                // 【デバッグ用】このプレイヤーへの送信内容のまとめ (3 秒に 1 回)
+                if (Config.DEBUG_LOG.get()) {
+                    long nowMs = System.currentTimeMillis();
+                    Long lastMs = DEBUG_LAST_LOG.get(player.getUUID());
+                    if (lastMs == null || nowMs - lastMs >= 3000L) {
+                        DEBUG_LAST_LOG.put(player.getUUID(), nowMs);
+                        StringBuilder list = new StringBuilder();
+                        int shown = 0;
+                        for (Entity v : vehicles) {
+                            if (shown++ >= 8) {
+                                list.append(" ...");
+                                break;
+                            }
+                            list.append(String.format(java.util.Locale.ROOT, " #%d(%.1fm)", v.getId(),
+                                    Math.sqrt(v.distanceToSqr(player.getX(), player.getY(), player.getZ()))));
+                        }
+                        SuperbHorizons.LOGGER.info(
+                                "[SH-DEBUG] server player={} dim={} vehiclesInLevel={} sent={} tooClose(<{}m)={} tooFar(>{}m)={} badType={} cappedFrom={} |{}",
+                                player.getGameProfile().getName(), serverLevel.dimension().location(),
+                                vehicles.size(), entries.size(), minDist, dbgTooClose, maxDist, dbgTooFar,
+                                dbgBadType, dbgBeforeCap, list);
+                    }
+                }
 
                 // --- 発射体 (砲弾・ロケット・ミサイル・爆弾など) ---
                 if (!activeProjectiles.isEmpty()) {

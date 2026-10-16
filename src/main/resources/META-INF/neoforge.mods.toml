@@ -5,11 +5,16 @@ issueTrackerURL = "https://github.com/VellEagle"
 
 [[mods]]
 modId = "superbhorizons"
-version = "1.0.0"
+version = "1.0.1"
 displayName = "Superb Horizons"
 authors = "VellEagle"
 description = '''
-Superb Horizons renders vehicles from Superb Warfare as ghost models even when they are beyond the normal draw distance. This mod is intended to be used in conjunction with distant horizons.'''
+Superb Horizons renders vehicles from Superb Warfare as ghost models even when they are beyond the normal draw distance. This mod is intended to be used in conjunction with distant horizons.
+'''
+
+# 本物の車両が実際に描かれたかを記録する Mixin (描画の内容には手を加えません)
+[[mixins]]
+config = "superbhorizons.mixins.json"
 
 [[dependencies.superbhorizons]]
 modId = "neoforge"

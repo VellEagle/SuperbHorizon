@@ -17,6 +17,8 @@ public class GhostVehicleStore {
     public static synchronized void applySnapshot(GhostSnapshotPacket pkt) {
         // 今回のスナップショットに含まれる ID を記録しつつ更新
         java.util.Set<Integer> alive = new java.util.HashSet<>();
+        // 【デバッグ用】受信前のゴーストの一覧 (増減をログに出すため。debugLog = true のときだけ)
+        java.util.Set<Integer> before = GhostDebug.on() ? new java.util.HashSet<>(GHOSTS.keySet()) : null;
 
         for (GhostSnapshotPacket.Entry e : pkt.entries) {
             alive.add(e.entityId);
@@ -35,6 +37,14 @@ public class GhostVehicleStore {
 
         // 含まれなくなった車両を削除
         GHOSTS.keySet().removeIf(id -> !alive.contains(id));
+
+        if (before != null) {
+            java.util.List<Integer> added = new java.util.ArrayList<>();
+            for (Integer id : alive) if (!before.contains(id)) added.add(id);
+            java.util.List<Integer> removed = new java.util.ArrayList<>();
+            for (Integer id : before) if (!alive.contains(id)) removed.add(id);
+            GhostDebug.store(pkt.entries.size(), added, removed);
+        }
     }
 
     /** エラーを 1 度だけログに出したか。 */

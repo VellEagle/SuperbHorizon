@@ -57,12 +57,17 @@ public final class GhostFireEffects {
         ClientLevel level = mc.level;
         if (level == null || ghost.projectile) return;
 
-        // 本物の車両が画面に描かれている場合は、SBW 本体が射撃を再生するので何もしません
+        // 本物の車両が画面に描かれている場合は、SBW 本体が射撃を再生するので何もしません。
+        // ただし DH が Minecraft の画面を LOD へ置き換える距離では、本物の車両が見えなくなり、
+        // 代わりにゴーストが描かれるため、ゴーストの射撃アニメーションだけは再生します。
         Vec3 cam = mc.gameRenderer.getMainCamera().getPosition();
-        if (GhostRenderer.isRealEntityShown(level, ghost, cam)) return;
+        boolean realShown = GhostRenderer.realEntityDrawsItself(level, ghost, cam);
+        boolean faded = GhostRenderer.inDhFadeZone(ghost, cam);
+        if (realShown && !faded) return;
 
         // --- 砲口の煙・炎 ---
-        spawnMuzzleParticles(level, ghost, shots);
+        // 本物の車両が描かれている場合は SBW 本体が出すので、二重にならないよう出しません
+        if (!realShown) spawnMuzzleParticles(level, ghost, shots);
 
         // --- 射撃アニメーション (砲身の後退・砲口の閃光など) ---
         Entity dummy = ghost.getDummy(level);

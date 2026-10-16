@@ -62,13 +62,17 @@ public class DhModelRenderer {
      * ここで描いたものは DH の LOD 地形と正しく前後関係が付きます。
      */
     public static void render() {
+        GhostDebug.dhCall();   // 【デバッグ用】DH の描画処理が呼ばれた回数
+        GhostDebug.dhFog(RenderSystem.getShaderFogStart(), RenderSystem.getShaderFogEnd());
         if (!isEnabled()) {
+            GhostDebug.dhNote("disabled");
             rendered = new HashSet<>();
             return;
         }
 
         float[] m = DhDepthHook.mvmProj;
         if (m == null || m.length < 16) {
+            GhostDebug.dhNote("no-dh-matrix");
             if (!loggedNoMatrix) {
                 loggedNoMatrix = true;
                 SuperbHorizons.LOGGER.warn(
@@ -114,6 +118,7 @@ public class DhModelRenderer {
         boolean depthReversed = false;
         try {
             depthReversed = DhDepthDirection.isReversed(dhMatrix, camera, !shaderMode);
+            GhostDebug.dhInfo(shaderMode, depthReversed);
         } catch (Throwable ignored) {
             // 判定できない場合は通常の向きとして扱います
         }
@@ -146,13 +151,30 @@ public class DhModelRenderer {
             PoseStack pose = new PoseStack();
 
             for (GhostVehicle ghost : ghosts) {
+                // DH が Minecraft の画面を LOD へ置き換える距離では、本物の車両が描かれていても見えなくなるため、
+                // 下の 2 つの判定をせずに、ここ (DH の画面) へゴーストを描きます
+                boolean faded = GhostRenderer.inDhFadeZone(ghost, cam);
                 // 本物のエンティティが画面に描かれているならそちらに任せる
                 // (読み込まれていても、遠くて描かれていない場合はゴーストを描きます)
-                if (GhostRenderer.isRealEntityShown(level, ghost, cam)) continue;
-                if (GhostRenderer.removedBySbw(level, ghost, cam)) continue;   // SBW が既に消した弾
+                if (!faded && GhostRenderer.realEntityDrawsItself(level, ghost, cam)) {
+                    GhostDebug.dh(ghost, "real-shown");
+                    continue;
+                }
+                // 読み込み済みの地形の中にいるゴーストは、通常の描画 (GhostRenderer) で描きます
+                if (!faded && GhostRenderer.insideLoadedTerrain(level, ghost, cam)) {
+                    GhostDebug.dh(ghost, "near-terrain");
+                    continue;
+                }
+                if (GhostRenderer.removedBySbw(level, ghost, cam)) {   // SBW が既に消した弾
+                    GhostDebug.dh(ghost, "sbw-removed");
+                    continue;
+                }
 
                 Entity dummy = ghost.getDummy(level);
-                if (dummy == null) continue;
+                if (dummy == null) {
+                    GhostDebug.dh(ghost, "no-dummy");
+                    continue;
+                }
 
                 float t = ghost.lerpFactor(intervalMs);
                 double gx = ghost.lerpX(t);
@@ -204,11 +226,14 @@ public class DhModelRenderer {
                     try {
                         if (depthReversed) useReversedDepthTest();
                         dispatcher.render(dummy, 0.0D, 0.0D, 0.0D, gyRot, 1.0F,
-                                pose, buffers, GhostRenderer.lightFor(dispatcher, ghost, dummy));   // 車両は空の光のみ (夜は暗い)、曳光弾は自ら光る
+                                pose, buffers, GhostRenderer.lightFor(dispatcher, ghost, dummy, false));   // 車両は空の光のみ (夜は暗い)、曳光弾は自ら光る
                         if (depthReversed) useReversedDepthTest();
                         buffers.endBatch();
                         drawn.add(ghost.entityId);
+                        GhostDebug.dh(ghost, "drawn");
                     } catch (Throwable e) {
+                        GhostDebug.dh(ghost, "error");
+                        GhostDebug.error("dh", ghost, e);
                         ghost.discardDummy();
                     } finally {
                         modelViewStack.popMatrix();
@@ -224,10 +249,13 @@ public class DhModelRenderer {
                 if (depthReversed) useReversedDepthTest();
                 try {
                     dispatcher.render(dummy, 0.0D, 0.0D, 0.0D, gyRot, 1.0F,
-                            pose, buffers, GhostRenderer.lightFor(dispatcher, ghost, dummy));   // 車両は空の光のみ (夜は暗い)、曳光弾は自ら光る
+                            pose, buffers, GhostRenderer.lightFor(dispatcher, ghost, dummy, false));   // 車両は空の光のみ (夜は暗い)、曳光弾は自ら光る
                     drawn.add(ghost.entityId);
+                        GhostDebug.dh(ghost, "drawn");
                 } catch (Throwable e) {
-                    ghost.discardDummy();
+                    GhostDebug.dh(ghost, "error");
+                        GhostDebug.error("dh", ghost, e);
+                        ghost.discardDummy();
                 }
                 pose.popPose();
             }
@@ -247,6 +275,8 @@ public class DhModelRenderer {
             }
 
         } catch (Throwable e) {
+            GhostDebug.dhNote("failed");
+            GhostDebug.error("dh-frame", null, e);
             if (!loggedFailure) {
                 loggedFailure = true;
                 SuperbHorizons.LOGGER.warn("[Superb Horizons] DH のバッファへの描画に失敗", e);
