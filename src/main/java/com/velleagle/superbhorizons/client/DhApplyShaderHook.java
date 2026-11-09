@@ -27,15 +27,25 @@ public class DhApplyShaderHook extends DhApiBeforeApplyShaderRenderEvent {
 
     private static boolean registered = false;
 
-    public static void register() {
-        if (registered) return;
-        registered = true;
+    /**
+     * イベントを登録します。何度呼んでも 1 回しか登録されません。
+     * 登録に失敗した場合は false を返し、次に呼ばれたときにもう一度試します。
+     */
+    public static boolean register() {
+        if (registered) return true;
         try {
             Object result = DhApiEventRegister.on(
                     DhApiBeforeApplyShaderRenderEvent.class, new DhApplyShaderHook());
+            if (!DhDepthTexture.succeeded(result)) {
+                SuperbHorizons.LOGGER.warn("[Superb Horizons] DH コピー直前イベントを登録できませんでした (後でもう一度試します) -> {}", result);
+                return false;
+            }
+            registered = true;
             SuperbHorizons.LOGGER.info("[Superb Horizons] DH コピー直前イベントを登録しました -> {}", result);
+            return true;
         } catch (Throwable e) {
-            SuperbHorizons.LOGGER.warn("[Superb Horizons] DH コピー直前イベントの登録に失敗", e);
+            SuperbHorizons.LOGGER.warn("[Superb Horizons] DH コピー直前イベントの登録に失敗 (後でもう一度試します)", e);
+            return false;
         }
     }
 
@@ -44,7 +54,7 @@ public class DhApplyShaderHook extends DhApiBeforeApplyShaderRenderEvent {
         try {
             // DH のバッファへゴーストモデルを描き込みます。
             // ここで描くと、LOD 地形との前後関係を GPU が処理してくれます。
-            DhModelRenderer.render();
+            DhModelRenderer.render(false);   // 先の組 (LOD 地形の範囲のゴースト)
         } catch (Throwable ignored) {
             // 1 フレーム取り損ねても問題ないので黙って無視します
         }

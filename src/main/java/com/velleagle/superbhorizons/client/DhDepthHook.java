@@ -48,16 +48,26 @@ public class DhDepthHook extends DhApiBeforeRenderEvent {
     /** イベントが 1 度でも呼ばれたか (原因切り分け用)。 */
     public static volatile boolean everCalled = false;
 
-    /** イベントを登録します。何度呼んでも 1 回しか登録されません。 */
-    public static void register() {
-        if (registered) return;
-        registered = true;
+    /**
+     * イベントを登録します。何度呼んでも 1 回しか登録されません。
+     * 登録に失敗した場合は false を返し、次に呼ばれたときにもう一度試します。
+     */
+    public static boolean register() {
+        if (registered) return true;
         try {
             Object result = DhApiEventRegister.on(DhApiBeforeRenderEvent.class, new DhDepthHook());
+            if (!DhDepthTexture.succeeded(result)) {
+                SuperbHorizons.LOGGER.warn("[Superb Horizons] DH 描画イベントを登録できませんでした (後でもう一度試します) -> {}",
+                        describe(result));
+                return false;
+            }
+            registered = true;
             SuperbHorizons.LOGGER.info("[Superb Horizons] DH 描画イベントを登録しました -> {}",
                     describe(result));
+            return true;
         } catch (Throwable e) {
-            SuperbHorizons.LOGGER.warn("[Superb Horizons] DH 描画イベントの登録に失敗", e);
+            SuperbHorizons.LOGGER.warn("[Superb Horizons] DH 描画イベントの登録に失敗 (後でもう一度試します)", e);
+            return false;
         }
     }
 

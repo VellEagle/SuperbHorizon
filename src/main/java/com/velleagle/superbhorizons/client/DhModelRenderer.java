@@ -61,9 +61,22 @@ public class DhModelRenderer {
      * DH のコピー直前に呼ばれます。
      * ここで描いたものは DH の LOD 地形と正しく前後関係が付きます。
      */
-    public static void render() {
-        GhostDebug.dhCall();   // 【デバッグ用】DH の描画処理が呼ばれた回数
-        GhostDebug.dhFog(RenderSystem.getShaderFogStart(), RenderSystem.getShaderFogEnd());
+    /** 先の組で判定した「DH の深度が逆向きか」(後の組で使い回します)。 */
+    private static boolean earlyDepthReversed = false;
+    private static boolean earlyDepthValid = false;
+
+    /**
+     * @param latePass false = 先の組 (他の DH 対応 Mod より先に呼ばれる。LOD 地形の範囲のゴーストを描く)
+     *                 true  = 後の組 (Simple Clouds などより後に呼ばれる。描画距離の中のゴーストを描く)
+     *                 理由は DhApplyShaderLateHook を参照してください。
+     */
+    public static void render(boolean latePass) {
+        if (!latePass) {
+            GhostDebug.dhCall();   // 【デバッグ用】DH の描画処理が呼ばれた回数
+            GhostDebug.dhFog(RenderSystem.getShaderFogStart(), RenderSystem.getShaderFogEnd());
+        }
+        // 後の組が登録できていなければ、先の組がすべてのゴーストを描きます (従来どおり)
+        boolean split = DhApplyShaderLateHook.isRegistered();
         if (!isEnabled()) {
             GhostDebug.dhNote("disabled");
             rendered = new HashSet<>();
@@ -117,12 +130,26 @@ public class DhModelRenderer {
         // DH の深度が逆向き (手前ほど大きい) かどうか
         boolean depthReversed = false;
         try {
-            depthReversed = DhDepthDirection.isReversed(dhMatrix, camera, !shaderMode);
-            GhostDebug.dhInfo(shaderMode, depthReversed);
+            if (latePass && earlyDepthValid) {
+                // 後の組では、他の Mod が OpenGL の設定を書き換えた後なので、先の組の判定結果を使います
+                depthReversed = earlyDepthReversed;
+            } else {
+                depthReversed = DhDepthDirection.isReversed(dhMatrix, camera, !shaderMode, !latePass);
+                GhostDebug.dhInfo(shaderMode, depthReversed);
+            }
+            if (!latePass) {
+                earlyDepthReversed = depthReversed;
+                earlyDepthValid = true;
+            } else {
+                earlyDepthValid = false;
+            }
         } catch (Throwable ignored) {
             // 判定できない場合は通常の向きとして扱います
         }
 
+        // 他の Mod (Simple Clouds など) と同じイベントの中で描くため、OpenGL の状態を控えておき、
+        // 描き終わったら正確に戻します (GlStateGuard)。
+        GlStateGuard glGuard = GlStateGuard.begin();
         try {
             // DH の行列をそのまま投影行列として設定します。
             // これで「カメラからの相対座標」がそのまま DH の画面座標になります。
@@ -161,10 +188,17 @@ public class DhModelRenderer {
                     continue;
                 }
                 // 読み込み済みの地形の中にいるゴーストは、通常の描画 (GhostRenderer) で描きます
-                if (!faded && GhostRenderer.insideLoadedTerrain(level, ghost, cam)) {
-                    GhostDebug.dh(ghost, "near-terrain");
+                boolean nearby = GhostRenderer.insideLoadedTerrain(level, ghost, cam);
+                if (!faded && nearby) {
+                    if (!latePass) GhostDebug.dh(ghost, "near-terrain");
                     continue;
                 }
+                // 描画距離の中のゴーストは後の組、LOD 地形の範囲のゴーストは先の組で描きます
+                // (Simple Clouds の雲・霧がゴーストの形にくり抜かれないように。DhApplyShaderLateHook を参照)
+                // 振り分けは距離だけで決めます (地形の準備状態は、地上に降りてから上昇した後などで変わるため)
+                boolean inVanilla = GhostRenderer.insideVanillaRange(ghost, cam);
+                if (split && inVanilla != latePass) continue;
+                logPass(ghost, latePass, faded, nearby, inVanilla);
                 if (GhostRenderer.removedBySbw(level, ghost, cam)) {   // SBW が既に消した弾
                     GhostDebug.dh(ghost, "sbw-removed");
                     continue;
@@ -293,9 +327,30 @@ public class DhModelRenderer {
             modelViewStack.popMatrix();
             RenderSystem.applyModelViewMatrix();
             RenderSystem.setProjectionMatrix(previousProjection, previousSorting);
+            // OpenGL の状態を、ゴーストを描く前 (DH や他の Mod が使っていた状態) へ戻します
+            glGuard.end();
         }
 
-        rendered = drawn;
+        if (latePass) {
+            Set<Integer> merged = new HashSet<>(rendered);
+            merged.addAll(drawn);
+            rendered = merged;
+        } else {
+            rendered = drawn;
+        }
+    }
+
+    /** 【デバッグ用】ゴーストごとに、どちらの組で描いたかを 2 秒に 1 回ログに出します (debugLog = true のときだけ) */
+    private static final java.util.Map<Integer, Long> DEBUG_PASS_LOG = new java.util.HashMap<>();
+
+    private static void logPass(GhostVehicle g, boolean latePass, boolean faded, boolean nearby, boolean inVanilla) {
+        if (!GhostDebug.on()) return;
+        long now = System.currentTimeMillis();
+        Long last = DEBUG_PASS_LOG.get(g.entityId);
+        if (last != null && now - last < 2000L) return;
+        DEBUG_PASS_LOG.put(g.entityId, now);
+        SuperbHorizons.LOGGER.info("[Superb Horizons][debug] DH pass={} ghost={} faded={} nearby={} inVanillaRange={} split={}",
+                latePass ? "late" : "early", g.entityId, faded, nearby, inVanilla, DhApplyShaderLateHook.isRegistered());
     }
 
     /**

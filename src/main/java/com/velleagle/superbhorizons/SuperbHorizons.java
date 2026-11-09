@@ -3,10 +3,12 @@ package com.velleagle.superbhorizons;
 import com.mojang.logging.LogUtils;
 import com.velleagle.superbhorizons.network.NetworkHandler;
 import com.velleagle.superbhorizons.server.FireTracker;
+import net.neoforged.api.distmarker.Dist;
 import net.neoforged.bus.api.IEventBus;
 import net.neoforged.fml.ModContainer;
 import net.neoforged.fml.common.Mod;
 import net.neoforged.fml.config.ModConfig;
+import net.neoforged.fml.loading.FMLEnvironment;
 import org.slf4j.Logger;
 
 /**
@@ -35,6 +37,11 @@ public class SuperbHorizons {
         modBus.addListener(NetworkHandler::register);
         // SBW の射撃イベントを受け取る準備 (SBW が無い場合は何もしません)
         FireTracker.register();
+        // Distant Horizons の描画イベントを、他の DH 対応 Mod (Simple Clouds など) より先に登録します
+        // (理由は DhDepthTexture.registerEventsEarly を参照)。DH が無ければ何もしません。
+        if (FMLEnvironment.dist == Dist.CLIENT) {
+            com.velleagle.superbhorizons.client.DhDepthTexture.registerEventsEarly();
+        }
         LOGGER.info("[Superb Horizons] initialized");
     }
 }
