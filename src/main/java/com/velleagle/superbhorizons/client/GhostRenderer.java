@@ -161,6 +161,42 @@ public class GhostRenderer {
      * true のとき、本物の車両は (描かれていても) 見えなくなっているので、ゴーストを DH の画面に描きます。
      * 判定には最新の受信位置を使います (DH 側と通常の描画側で、同じフレームの判定が必ず一致するように)。
      */
+    /**
+     * ゴーストの位置が、Minecraft の描画距離 (横方向) の中か。
+     *
+     * DH はこの範囲には LOD 地形を描かないため、DH の奥行きには何も入っていません。
+     * Simple Clouds などは DH の奥行きを見て雲や霧を描くので、この範囲のゴーストを
+     * 他の Mod より先に DH の奥行きへ描き込むと、雲がゴーストの形にくり抜かれてしまいます。
+     * DhModelRenderer の「先の組 / 後の組」の振り分けに使います。
+     *
+     * 地形の読み込み・準備の状態 (insideLoadedTerrain) は、Embeddium などの描画最適化 Mod や
+     * カメラの移動 (一度地上に降りてから上昇する等) で変わることがあるため、ここでは距離だけで判定します。
+     */
+    public static boolean insideVanillaRange(GhostVehicle ghost, Vec3 cam) {
+        double range = Minecraft.getInstance().options.getEffectiveRenderDistance() * 16.0;
+        double dx = ghost.x - cam.x, dz = ghost.z - cam.z;
+        return dx * dx + dz * dz <= range * range;
+    }
+
+    /**
+     * 本物の車両の描画を取りやめるべきか (LevelRendererMixin から、本物を描く直前に呼ばれます)。
+     *
+     * DH が画面を LOD へ置き換える距離にある車両は、ゴーストを DH の画面に描いています。
+     * このとき本物も描かれていると、本物とゴーストが同じ位置に重なり、
+     * DH や Simple Clouds の合成で「車両とその周り (茂みなど) だけが雲を貫通して見える」状態になりました
+     * (2026/11/01: 一度地上に降りて本物が描かれるようになってから、再び雲の上へ上昇すると発生。
+     *  ワールドに入った直後は本物が描かれていないため発生しない)。
+     * そこで、ゴーストを DH の画面に描いた車両は、置き換えの距離にある間だけ本物を描きません。
+     * 置き換えの距離より近づけば、本物が描かれてゴーストは消えます (従来どおり)。
+     */
+    public static boolean hideRealBecauseGhostInDh(Entity entity, double camX, double camY, double camZ) {
+        if (!Config.RENDER_GHOSTS.get() || !useDhModel()) return false;
+        GhostVehicle ghost = GhostVehicleStore.get(entity.getId());
+        if (ghost == null || ghost.projectile) return false;
+        if (!DhModelRenderer.renderedLastFrame().contains(entity.getId())) return false;
+        return inDhFadeZone(ghost, new Vec3(camX, camY, camZ));
+    }
+
     public static boolean inDhFadeZone(GhostVehicle ghost, Vec3 cam) {
         if (!ModList.get().isLoaded("distanthorizons")) return false;
         double d = dhFadeStartDistance();
@@ -255,7 +291,9 @@ public class GhostRenderer {
                 continue;
             }
             // DH が Minecraft の画面を LOD へ置き換える距離か (本物の車両も見えなくなる距離)
-            boolean faded = inDhFadeZone(ghost, cam);
+            // DH の画面にゴーストを描く方式 (dhModel) のときだけ考えます。
+            // ghostStyle = model のときにこれを考えると、本物とゴーストが同時に描かれて重なってしまいます
+            boolean faded = dh && inDhFadeZone(ghost, cam);
             // 本物のエンティティが画面に描かれているならそちらに任せる (置き換えで見えなくなる距離は除く)
             if (!faded && realEntityDrawsItself(level, ghost, cam)) {
                 GhostDebug.vanilla(ghost, "real-shown");

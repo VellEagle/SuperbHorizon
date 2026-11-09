@@ -57,12 +57,21 @@ public final class DhDepthDirection {
      *                      DH が残した値は当てにならないので使いません。
      */
     public static boolean isReversed(Matrix4f dhMatrix, Camera camera, boolean useClearValue) {
+        return isReversed(dhMatrix, camera, useClearValue, true);
+    }
+
+    /**
+     * @param mayQueryGl OpenGL の状態 (深度範囲・クリア値) を問い合わせてよいか。
+     *                   他の Mod (Simple Clouds など) の処理の後では、クリア値が書き換えられていて
+     *                   当てにならないため、false にして前回の問い合わせ結果を使います。
+     */
+    public static boolean isReversed(Matrix4f dhMatrix, Camera camera, boolean useClearValue, boolean mayQueryGl) {
         String setting = Config.DH_DEPTH_DIRECTION.get().trim().toLowerCase();
         if (setting.equals("normal")) return false;
         if (setting.equals("reversed")) return true;
 
         Boolean byMatrix = reversedByMatrix(dhMatrix, camera);
-        queryGlState();
+        if (mayQueryGl) queryGlState();
 
         boolean reversed;
         if (byMatrix != null) {
