@@ -283,7 +283,11 @@ public class GhostRenderer {
         VertexSorting sorting = RenderSystem.getVertexSorting();
 
         // ---- 描画 --------------------------------------------------
+        // Accelerated Rendering が入っている場合、ゴーストを描く間だけ通常の描き方にしてもらいます
+        // (後でまとめて描かれると位置が抜け落ちてプレイヤーの真上に出るため。AcceleratedRenderingCompat を参照)
         int drawn = 0;
+        boolean arVanilla = AcceleratedRenderingCompat.useVanillaPipeline();
+        try {
         for (GhostVehicle ghost : ghosts) {
             // SBW が既に消した弾は、ゴーストでも出しません
             if (removedBySbw(level, ghost, cam)) {
@@ -362,6 +366,8 @@ public class GhostRenderer {
                     try {
                         dispatcher.render(dummy, 0.0D, 0.0D, 0.0D, gyRot, 1.0F, pose, buffers, light);
                         buffers.endBatch();
+                        // SBW Optimized が後回しにした部品 (転輪・履帯など) を、ゴーストの位置のまま描き切らせます
+                        SbwOptimizedCompat.flushQueuedModels();
                     } finally {
                         modelViewStack.popPose();
                         RenderSystem.applyModelViewMatrix();
@@ -388,6 +394,11 @@ public class GhostRenderer {
         }
 
         buffers.endBatch();
+        // SBW Optimized が後回しにした部品 (転輪・履帯など) を、ゴーストの位置のまま描き切らせます
+        SbwOptimizedCompat.flushQueuedModels();
+        } finally {
+            AcceleratedRenderingCompat.restore(arVanilla);
+        }
 
         // ---- 描画状態を元へ戻す ------------------------------------
         dispatcher.setRenderShadow(true);

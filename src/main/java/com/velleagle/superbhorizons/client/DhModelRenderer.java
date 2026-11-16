@@ -149,6 +149,9 @@ public class DhModelRenderer {
         // 他の Mod (Simple Clouds など) と同じイベントの中で描くため、OpenGL の状態を控えておき、
         // 描き終わったら正確に戻します (GlStateGuard)。
         GlStateGuard glGuard = GlStateGuard.begin();
+        // Accelerated Rendering が入っている場合、ゴーストを描く間だけ通常の描き方にしてもらいます
+        // (後でまとめて描かれると位置が抜け落ちてプレイヤーの真上に出るため。AcceleratedRenderingCompat を参照)
+        boolean arVanilla = AcceleratedRenderingCompat.useVanillaPipeline();
         try {
             // DH の行列をそのまま投影行列として設定します。
             // これで「カメラからの相対座標」がそのまま DH の画面座標になります。
@@ -260,6 +263,9 @@ public class DhModelRenderer {
                                 pose, buffers, GhostRenderer.lightFor(dispatcher, ghost, dummy, false));   // 車両は空の光のみ (夜は暗い)、曳光弾は自ら光る
                         if (depthReversed) useReversedDepthTest();
                         buffers.endBatch();
+                        // SBW Optimized が後回しにした部品 (転輪・履帯など) を、ゴーストの位置のまま描き切らせます
+                        if (depthReversed) useReversedDepthTest();
+                        SbwOptimizedCompat.flushQueuedModels();
                         drawn.add(ghost.entityId);
                         GhostDebug.dh(ghost, "drawn");
                     } catch (Throwable e) {
@@ -295,6 +301,9 @@ public class DhModelRenderer {
             // (途中で別の比較方法に切り替えた描画があっても確実に効かせるため)。
             if (depthReversed) useReversedDepthTest();
             buffers.endBatch();
+            // SBW Optimized が後回しにした部品 (転輪・履帯など) を、ゴーストの位置のまま描き切らせます
+            if (depthReversed) useReversedDepthTest();
+            SbwOptimizedCompat.flushQueuedModels();
 
             // シェーダー使用時: ゴーストが描かれなかった画素の深度を元に戻します
             ShaderDhOcclusion.end();
@@ -324,6 +333,8 @@ public class DhModelRenderer {
             modelViewStack.popPose();
             RenderSystem.applyModelViewMatrix();
             RenderSystem.setProjectionMatrix(previousProjection, previousSorting);
+            // Accelerated Rendering の描き方を元に戻します
+            AcceleratedRenderingCompat.restore(arVanilla);
             // OpenGL の状態を、ゴーストを描く前 (DH や他の Mod が使っていた状態) へ戻します
             glGuard.end();
         }
