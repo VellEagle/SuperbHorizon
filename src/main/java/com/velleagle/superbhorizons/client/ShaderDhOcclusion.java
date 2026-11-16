@@ -59,6 +59,8 @@ public final class ShaderDhOcclusion {
     private static boolean glReady = false;
     private static boolean glFailed = false;
     private static int prepassProgram, restoreProgram, vao;
+    /** 奥行きの基準を変換しながら処理する版 (バニラ地形も遮蔽物として扱う。下の CONV_* を参照) */
+    private static int convPrepassProgram, convRestoreProgram;
     private static int targetFbo, origFbo, curFbo;
     private static int origTex, curTex;
     private static int texWidth = -1, texHeight = -1, texFormat = -1;
@@ -69,6 +71,14 @@ public final class ShaderDhOcclusion {
     private static boolean activeReversed = false;
     private static int activeDhTex = -1;
     private static int activeTargetTex = -1;
+    private static boolean activeConverted = false;
+    /** このフレームの投影行列の奥行きの係数 (m22, m32)。バニラ地形用と LOD 用 */
+    private static final float[] activeVanProj = new float[2];
+    private static final float[] activeDhProj = new float[2];
+
+    /** 直近の lodMatrix で使った投影行列 (奥行きの変換に使います)。取得できなければ null */
+    private static Matrix4f lastVanillaProjection;
+    private static Matrix4f lastDhProjection;
 
     private static boolean loggedStart = false;
     private static boolean loggedFailure = false;
@@ -102,6 +112,8 @@ public final class ShaderDhOcclusion {
      * Oculus の LodRendererEvents と同じ計算式です。取得できなければ null。
      */
     public static Matrix4f lodMatrix(float near, float far) {
+        lastVanillaProjection = null;
+        lastDhProjection = null;
         if (!capturedLookedUp) {
             capturedLookedUp = true;
             try {
@@ -118,10 +130,12 @@ public final class ShaderDhOcclusion {
             Matrix4fc projection = (Matrix4fc) getGbufferProjection.invoke(capturedState);
             Matrix4fc modelView = (Matrix4fc) getGbufferModelView.invoke(capturedState);
             if (projection == null || modelView == null) return null;
-            return new Matrix4f()
+            Matrix4f dhProjection = new Matrix4f()
                     .setPerspective(projection.perspectiveFov(),
-                            projection.m11() / projection.m00(), near, far)
-                    .mul(modelView);
+                            projection.m11() / projection.m00(), near, far);
+            lastVanillaProjection = new Matrix4f(projection);
+            lastDhProjection = new Matrix4f(dhProjection);
+            return new Matrix4f(dhProjection).mul(modelView);
         } catch (Throwable e) {
             return null;
         }
@@ -173,22 +187,31 @@ public final class ShaderDhOcclusion {
             GL30.glBindFramebuffer(GL30.GL_FRAMEBUFFER, targetFbo);
             GL11.glViewport(0, 0, texWidth, texHeight);
             setupFullscreenState();
+            // 奥行きの基準をそろえられるなら、バニラ地形 (読み込み済みのチャンク) も遮蔽物として書き写します
+            boolean converted = canConvert(reversed);
             GL11.glEnable(GL11.GL_DEPTH_TEST);
-            GL11.glDepthFunc(reversed ? GL11.GL_GREATER : GL11.GL_LESS);
+            GL11.glDepthFunc(converted ? GL11.GL_ALWAYS : (reversed ? GL11.GL_GREATER : GL11.GL_LESS));
             GL11.glDepthMask(true);
 
-            GL20.glUseProgram(prepassProgram);
+            int program = converted ? convPrepassProgram : prepassProgram;
+            GL20.glUseProgram(program);
             bindDepthSampler(0, dhTex);
-            GL20.glUniform1i(GL20.glGetUniformLocation(prepassProgram, "dhDepth"), 0);
-            GL20.glUniform2f(GL20.glGetUniformLocation(prepassProgram, "scale"),
+            GL20.glUniform1i(GL20.glGetUniformLocation(program, "dhDepth"), 0);
+            GL20.glUniform2f(GL20.glGetUniformLocation(program, "scale"),
                     dhSize[0] / (float) texWidth, dhSize[1] / (float) texHeight);
-            GL20.glUniform1f(GL20.glGetUniformLocation(prepassProgram, "emptyDepth"),
+            GL20.glUniform1f(GL20.glGetUniformLocation(program, "emptyDepth"),
                     reversed ? 0.0F : 1.0F);
+            if (converted) {
+                bindDepthSampler(1, origTex);
+                GL20.glUniform1i(GL20.glGetUniformLocation(program, "origDepth"), 1);
+                setProjectionUniforms(program);
+            }
             GL30.glBindVertexArray(vao);
             GL11.glDrawArrays(GL11.GL_TRIANGLES, 0, 3);
 
             active = true;
             activeReversed = reversed;
+            activeConverted = converted;
             activeDhTex = dhTex;
             activeTargetTex = targetTex;
 
@@ -226,19 +249,21 @@ public final class ShaderDhOcclusion {
 
             int[] dhSize = textureSize(activeDhTex);
 
-            GL20.glUseProgram(restoreProgram);
+            int program = activeConverted ? convRestoreProgram : restoreProgram;
+            GL20.glUseProgram(program);
             bindDepthSampler(0, activeDhTex);
             bindDepthSampler(1, origTex);
             bindDepthSampler(2, curTex);
-            GL20.glUniform1i(GL20.glGetUniformLocation(restoreProgram, "dhDepth"), 0);
-            GL20.glUniform1i(GL20.glGetUniformLocation(restoreProgram, "origDepth"), 1);
-            GL20.glUniform1i(GL20.glGetUniformLocation(restoreProgram, "curDepth"), 2);
-            GL20.glUniform2f(GL20.glGetUniformLocation(restoreProgram, "scale"),
+            GL20.glUniform1i(GL20.glGetUniformLocation(program, "dhDepth"), 0);
+            GL20.glUniform1i(GL20.glGetUniformLocation(program, "origDepth"), 1);
+            GL20.glUniform1i(GL20.glGetUniformLocation(program, "curDepth"), 2);
+            GL20.glUniform2f(GL20.glGetUniformLocation(program, "scale"),
                     dhSize[0] / (float) texWidth, dhSize[1] / (float) texHeight);
-            GL20.glUniform1f(GL20.glGetUniformLocation(restoreProgram, "emptyDepth"),
+            GL20.glUniform1f(GL20.glGetUniformLocation(program, "emptyDepth"),
                     activeReversed ? 0.0F : 1.0F);
-            GL20.glUniform1f(GL20.glGetUniformLocation(restoreProgram, "reversed"),
+            GL20.glUniform1f(GL20.glGetUniformLocation(program, "reversed"),
                     activeReversed ? 1.0F : 0.0F);
+            if (activeConverted) setProjectionUniforms(program);
             GL30.glBindVertexArray(vao);
             GL11.glDrawArrays(GL11.GL_TRIANGLES, 0, 3);
         } catch (Throwable e) {
@@ -261,6 +286,8 @@ public final class ShaderDhOcclusion {
             if (curTex > 0) GL11.glDeleteTextures(curTex);
             GL20.glDeleteProgram(prepassProgram);
             GL20.glDeleteProgram(restoreProgram);
+            GL20.glDeleteProgram(convPrepassProgram);
+            GL20.glDeleteProgram(convRestoreProgram);
             GL30.glDeleteVertexArrays(vao);
         } catch (Throwable ignored) {
         }
@@ -327,12 +354,106 @@ public final class ShaderDhOcclusion {
           + "    fragColor = vec4(0.0);\n"
           + "}\n";
 
+    // ------------------------------------------------------------------
+    // 奥行きの基準を変換する版
+    // ------------------------------------------------------------------
+    //
+    // ■ なぜ必要か (2026/11/13 の報告: 「ゴーストが読み込み済みのチャンクを透けて見える。DH の LOD の裏には隠れる」)
+    // 通常の深度バッファに入っているバニラ地形の奥行きは「Minecraft の遠近設定」(近距離 0.05 ブロック〜) の値、
+    // ゴーストと LOD 地形の奥行きは「DH の遠近設定」(近距離 100 ブロック前後〜) の値です。
+    // 同じ 0〜1 の数値でも意味が全く違うため、そのまま比べると、バニラ地形は (数値が大きいので)
+    // 常にゴーストより奥にあると判定され、ゴーストが地形を貫通して見えていました。
+    //
+    // そこで、
+    //  手順 2: バニラ地形と LOD 地形の奥行きを「カメラからの距離」に戻し、手前の方を DH の基準で書き込む
+    //  手順 4: ゴーストが描かれた画素は、ゴーストの奥行きを Minecraft の基準に変換して書き戻す
+    //          (後から描かれるバニラ地形や水なども、ゴーストと正しく前後を比べられるように)
+    // とします。投影行列の奥行きの係数 (m22, m32) を使って変換します。
+
+    private static final String CONV_COMMON =
+            "uniform sampler2D dhDepth;\n"
+          + "uniform sampler2D origDepth;\n"
+          + "uniform vec2 scale;\n"
+          + "uniform float emptyDepth;\n"
+          + "uniform vec2 vanProj;\n"   // バニラの投影行列の (m22, m32)
+          + "uniform vec2 dhProj;\n"    // LOD の投影行列の (m22, m32)
+          + "const float INF = 1.0e30;\n"
+          + "float eyeOf(float d, vec2 p) {\n"           // 深度の値 → カメラからの距離 (視線方向)
+          + "    float e = p.y / ((d * 2.0 - 1.0) + p.x);\n"
+          + "    return e > 0.0 ? e : INF;\n"
+          + "}\n"
+          + "float depthOf(float e, vec2 p) {\n"         // カメラからの距離 → 深度の値
+          + "    return clamp((-p.x + p.y / e) * 0.5 + 0.5, 0.0, 1.0);\n"
+          + "}\n"
+          + "float sceneEye(ivec2 px) {\n"               // バニラ地形と LOD 地形の、手前の方の距離
+          + "    float v = texelFetch(origDepth, px, 0).r;\n"
+          + "    float eV = v >= 1.0 ? INF : eyeOf(v, vanProj);\n"
+          + "    float d = texelFetch(dhDepth, ivec2(gl_FragCoord.xy * scale), 0).r;\n"
+          + "    float eL = d == emptyDepth ? INF : eyeOf(d, dhProj);\n"
+          + "    return min(eV, eL);\n"
+          + "}\n";
+
+    private static final String CONV_PREPASS_FRAGMENT =
+            "#version 150\n"
+          + CONV_COMMON
+          + "out vec4 fragColor;\n"
+          + "void main() {\n"
+          + "    float e = sceneEye(ivec2(gl_FragCoord.xy));\n"
+          + "    if (e >= INF) discard;\n"
+          + "    gl_FragDepth = depthOf(e, dhProj);\n"
+          + "    fragColor = vec4(0.0);\n"
+          + "}\n";
+
+    private static final String CONV_RESTORE_FRAGMENT =
+            "#version 150\n"
+          + CONV_COMMON
+          + "uniform sampler2D curDepth;\n"
+          + "out vec4 fragColor;\n"
+          + "void main() {\n"
+          + "    ivec2 p = ivec2(gl_FragCoord.xy);\n"
+          + "    float orig = texelFetch(origDepth, p, 0).r;\n"
+          + "    float cur = texelFetch(curDepth, p, 0).r;\n"
+          + "    float e = sceneEye(p);\n"
+          + "    float before = e >= INF ? orig : depthOf(e, dhProj);\n"   // 手順 2 で書いた値
+          + "    if (cur < before - 0.000002) {\n"
+          + "        gl_FragDepth = depthOf(eyeOf(cur, dhProj), vanProj);\n" // ゴーストを Minecraft の基準へ
+          + "    } else {\n"
+          + "        gl_FragDepth = orig;\n"
+          + "    }\n"
+          + "    fragColor = vec4(0.0);\n"
+          + "}\n";
+
+    /** 奥行きの基準を変換する版を使えるか (投影行列が取れていて、通常の遠近投影で、深度が逆向きでない) */
+    private static boolean canConvert(boolean reversed) {
+        if (reversed) return false;
+        Matrix4f van = lastVanillaProjection;
+        Matrix4f dh = lastDhProjection;
+        if (van == null || dh == null) return false;
+        if (!isPerspective(van) || !isPerspective(dh)) return false;
+        activeVanProj[0] = van.m22();
+        activeVanProj[1] = van.m32();
+        activeDhProj[0] = dh.m22();
+        activeDhProj[1] = dh.m32();
+        return true;
+    }
+
+    private static boolean isPerspective(Matrix4f m) {
+        return Math.abs(m.m23() + 1.0F) < 1.0e-4F && Math.abs(m.m33()) < 1.0e-4F && m.m32() != 0.0F;
+    }
+
+    private static void setProjectionUniforms(int program) {
+        GL20.glUniform2f(GL20.glGetUniformLocation(program, "vanProj"), activeVanProj[0], activeVanProj[1]);
+        GL20.glUniform2f(GL20.glGetUniformLocation(program, "dhProj"), activeDhProj[0], activeDhProj[1]);
+    }
+
     private static boolean ensureGl() {
         if (glReady) return true;
         if (glFailed) return false;
         try {
             prepassProgram = link(VERTEX, PREPASS_FRAGMENT);
             restoreProgram = link(VERTEX, RESTORE_FRAGMENT);
+            convPrepassProgram = link(VERTEX, CONV_PREPASS_FRAGMENT);
+            convRestoreProgram = link(VERTEX, CONV_RESTORE_FRAGMENT);
             vao = GL30.glGenVertexArrays();
             targetFbo = GL30.glGenFramebuffers();
             origFbo = GL30.glGenFramebuffers();
